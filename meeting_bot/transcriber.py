@@ -24,6 +24,32 @@ log = logging.getLogger(__name__)
 _MAX_CHAR_RUN = 30      # any single char repeated > this many times => garbage
 _MAX_TOKEN_RATIO = 0.7  # most-frequent token / total tokens > this => garbage
 _MIN_TOKENS = 10        # only apply token-ratio check when there are enough tokens
+_MAX_REPEAT_PERIOD = 10  # characters; covers single chars up to short syllables/words
+
+
+def _max_repeat_run_length(text: str, max_period: int = _MAX_REPEAT_PERIOD) -> int:
+    """Longest consecutive run built from a short repeating substring.
+
+    For each candidate period p (1..max_period), scans for the longest
+    stretch where text[j] == text[j - p], i.e. text[i:i+p] repeating back
+    to back. period=1 is the original single-character-run check; larger
+    periods catch multi-character repeating units (e.g. a 3-char Thai
+    syllable repeated hundreds of times with no whitespace).
+    """
+    n = len(text)
+    best = 1
+    for period in range(1, max_period + 1):
+        i = 0
+        while i < n - period:
+            j = i + period
+            run_len = period
+            while j < n and text[j] == text[j - period]:
+                run_len += 1
+                j += 1
+            if run_len > best:
+                best = run_len
+            i = j if j > i else i + 1
+    return best
 
 
 def is_garbage_transcription(text: str) -> bool:
@@ -31,8 +57,11 @@ def is_garbage_transcription(text: str) -> bool:
 
     Two heuristics (either one firing is enough):
 
-    1. **Character run length** — if any single character repeats more than
-       ``_MAX_CHAR_RUN`` times consecutively (e.g. ``"ZZZZZZZZZ..."``).
+    1. **Repeating-substring run length** — if any short substring (period 1
+       up to ``_MAX_REPEAT_PERIOD`` characters, so single chars through short
+       syllables/words) repeats back-to-back for more than ``_MAX_CHAR_RUN``
+       total characters (e.g. ``"ZZZZZZZZZ..."`` or a Thai syllable repeated
+       with no whitespace, ``"ตามตามตาม..."``).
     2. **Token repetition ratio** — split on whitespace; if there are at least
        ``_MIN_TOKENS`` tokens and the most frequent one accounts for more than
        ``_MAX_TOKEN_RATIO`` of the total (e.g. ``"Se Se Se Se Se..."``).
@@ -43,18 +72,8 @@ def is_garbage_transcription(text: str) -> bool:
     if not text or not text.strip():
         return False
 
-    # 1. Max character run length
-    max_run = 1
-    current_run = 1
-    chars = text.strip()
-    for i in range(1, len(chars)):
-        if chars[i] == chars[i - 1]:
-            current_run += 1
-            if current_run > max_run:
-                max_run = current_run
-        else:
-            current_run = 1
-    if max_run > _MAX_CHAR_RUN:
+    # 1. Max repeating-substring run length (subsumes the old single-char run).
+    if _max_repeat_run_length(text) > _MAX_CHAR_RUN:
         return True
 
     # 2. Token repetition ratio

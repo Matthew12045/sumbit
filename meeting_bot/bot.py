@@ -13,7 +13,7 @@ from .chunker import SilenceChunker
 from .config import Config
 from .poster import Poster
 from .sink import MeetingSink
-from .summarizer import Summarizer
+from .summarizer import EmptySummaryError, Summarizer
 from .summary_parse import parse_summary
 from .transcriber import Transcriber
 from .transcript import Transcript
@@ -284,6 +284,20 @@ class MeetingBot(discord.Client):
                              len(summary.topics), len(summary.decisions), len(summary.action_items))
                     poster = Poster(self.cfg)
                     await poster.post(target, summary, meta=meta)
+                except EmptySummaryError:
+                    log.exception(
+                        "gateway returned no text for the summary — posting a "
+                        "failure note instead of an empty summary"
+                    )
+                    note = (
+                        "⚠️ การสร้างสรุปการประชุมล้มเหลว: โมเดลไม่ได้ตอบกลับเนื้อหาใด ๆ "
+                        "(ใช้โทเค็นทั้งหมดไปกับการคิดคำนวณ) "
+                        "ลองเพิ่ม SUMMARY_MAX_TOKENS ในไฟล์ .env"
+                    )
+                    try:
+                        await target.send(note)
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to post empty-summary failure note")
                 except Exception as exc:  # noqa: BLE001
                     exc_name = type(exc).__name__
                     if "Timeout" in exc_name or "timeout" in exc_name.lower():

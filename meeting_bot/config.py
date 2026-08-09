@@ -35,6 +35,7 @@ _OPTIONAL_FLOAT_ENV = (
     ("MAX_CHUNK_SECONDS", "max_chunk_seconds", 30.0),
     ("SUMMARIZE_TIMEOUT_SECONDS", "summarize_timeout_seconds", 300.0),
     ("MAX_PROMPT_CHARS", "max_prompt_chars", 6000.0),
+    ("SUMMARY_MAX_TOKENS", "summary_max_tokens", 4096.0),
 )
 
 
@@ -55,6 +56,7 @@ class Config:
     max_chunk_seconds: float = 30.0     # force-close cap
     summarize_timeout_seconds: float = 300.0  # SDK client timeout for gateway
     max_prompt_chars: int = 6000        # transcript truncation limit
+    summary_max_tokens: int = 4096      # gateway output-token budget (qwen thinking)
 
 
 def load_config(path: str | os.PathLike = ".env") -> Config:
@@ -102,6 +104,7 @@ def load_config(path: str | os.PathLike = ".env") -> Config:
         max_chunk_seconds=_optional_float("MAX_CHUNK_SECONDS", 30.0),
         summarize_timeout_seconds=_optional_float("SUMMARIZE_TIMEOUT_SECONDS", 300.0),
         max_prompt_chars=int(_optional_float("MAX_PROMPT_CHARS", 6000.0)),
+        summary_max_tokens=int(_optional_float("SUMMARY_MAX_TOKENS", 4096.0)),
     )
 
 

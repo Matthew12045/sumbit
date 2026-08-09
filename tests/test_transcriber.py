@@ -55,9 +55,12 @@ class TestIsGarbageTranscription:
         assert is_garbage_transcription(text)
 
     def test_balanced_tokens_passes(self) -> None:
-        # 50% each  →  under 70%  →  ok
+        # 50% each, so the single-token ratio heuristic (2) would NOT fire.
+        # But each word repeats consecutively many times in a row, which is
+        # not normal speech — the generalized repeating-run check (heuristic
+        # 1, period covers "hello"/"world" themselves) catches it.
         text = " ".join(["hello"] * 10 + ["world"] * 10)
-        assert not is_garbage_transcription(text)
+        assert is_garbage_transcription(text)
 
     def test_high_repetition_but_few_tokens_passes(self) -> None:
         # Only 5 tokens total — below _MIN_TOKENS (10)
@@ -80,3 +83,12 @@ class TestIsGarbageTranscription:
         # Normal Thai conversation with some word repetition
         text = "ครับ ครับ ครับ เราเห็นด้วย เราเห็นด้วย งั้นเริ่มเลยนะครับ"
         assert not is_garbage_transcription(text)
+
+    def test_thai_no_whitespace_repetition_detected(self) -> None:
+        # Real whisper hallucination from a meeting log: the syllable "ตาม"
+        # repeated ~111 times with no whitespace (Thai has no spaces between
+        # words). Previously slipped past both heuristics — single-char run
+        # doesn't match (ต ≠ า ≠ ม) and the whole string is one whitespace
+        # token, below _MIN_TOKENS. Generalized run check catches it.
+        text = "ตาม" * 111
+        assert is_garbage_transcription(text)

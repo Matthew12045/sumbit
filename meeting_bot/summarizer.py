@@ -14,7 +14,7 @@ from .config import Config
 
 log = logging.getLogger(__name__)
 
-__all__ = ["Summarizer"]
+__all__ = ["Summarizer", "EmptySummaryError"]
 
 _SYSTEM_PROMPT = """\
 คุณคือผู้ช่วยสรุปการประชุม จงตอบเป็นภาษาไทยเท่านั้น
@@ -32,6 +32,28 @@ _USER_SUFFIX = (
     "\n\nโปรดตอบเฉพาะ JSON ตามรูปแบบที่กำหนดเท่านั้น "
     "ห้ามมีข้อความอื่นนอกจาก JSON และถ้าส่วนใดไม่มีเนื้อหาให้ใช้ []"
 )
+
+
+class EmptySummaryError(RuntimeError):
+    """Gateway returned HTTP 200 OK but no usable text block.
+
+    Almost always the qwen thinking-budget issue: the model spends its whole
+    ``max_tokens`` on internal reasoning and never emits a final ``text``
+    block, so the API call "succeeds" while ``summarize`` yields ``""``.
+    """
+
+
+def _non_text_char_count(blocks) -> int:
+    """Total characters in non-text blocks, checking .text and .thinking."""
+    total = 0
+    for block in blocks:
+        if getattr(block, "type", "") == "text":
+            continue
+        for attr in ("text", "thinking"):
+            value = getattr(block, attr, None)
+            if isinstance(value, str):
+                total += len(value)
+    return total
 
 
 class Summarizer:
@@ -60,7 +82,7 @@ class Summarizer:
             try:
                 response = self._client.messages.create(
                     model=self.cfg.gateway_model,
-                    max_tokens=2000,
+                    max_tokens=self.cfg.summary_max_tokens,
                     temperature=0.0,
                     system=_SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": transcript_text + _USER_SUFFIX}],
@@ -69,6 +91,26 @@ class Summarizer:
                     block.text for block in response.content
                     if getattr(block, "type", "") == "text"
                 )
+                if not text.strip():
+                    block_types = [
+                        getattr(block, "type", "?") for block in response.content
+                    ]
+                    log.warning(
+                        "summarizer returned no text (stop_reason=%s, blocks=%s, "
+                        "non-text chars=%d) — the model likely spent its whole "
+                        "token budget on reasoning; try raising SUMMARY_MAX_TOKENS "
+                        "in .env",
+                        getattr(response, "stop_reason", "unknown"),
+                        block_types,
+                        _non_text_char_count(response.content),
+                    )
+                    raise EmptySummaryError(
+                        "gateway returned no text (stop_reason=%s, blocks=%s)"
+                        % (
+                            getattr(response, "stop_reason", "unknown"),
+                            block_types,
+                        )
+                    )
                 return text
             except self._anthropic.APITimeoutError as exc:
                 last_exc = exc
