@@ -30,10 +30,10 @@ _REQUIRED_ENV = (
 
 _OPTIONAL_FLOAT_ENV = (
     ("SILENCE_THRESHOLD", "silence_threshold", 0.01),
-    ("SILENCE_SECONDS", "silence_seconds", 0.5),
-    ("MIN_CHUNK_SECONDS", "min_chunk_seconds", 0.15),
+    ("SILENCE_SECONDS", "silence_seconds", 0.8),
+    ("MIN_CHUNK_SECONDS", "min_chunk_seconds", 1.0),
     ("MAX_CHUNK_SECONDS", "max_chunk_seconds", 30.0),
-    ("SUMMARIZE_TIMEOUT_SECONDS", "summarize_timeout_seconds", 300.0),
+    ("SUMMARIZE_TIMEOUT_SECONDS", "summarize_timeout_seconds", 90.0),
     ("MAX_PROMPT_CHARS", "max_prompt_chars", 6000.0),
     ("SUMMARY_MAX_TOKENS", "summary_max_tokens", 4096.0),
 )
@@ -48,13 +48,13 @@ class Config:
     anthropic_base_url: str      # no trailing /v1 (the SDK appends /v1/messages)
     anthropic_auth_token: str
     gateway_model: str           # qwen3.6-35b-a3b
-    whisper_model: str           # mlx-community/whisper-large-v3-turbo
+    whisper_model: str           # mlx-community/whisper-large-v3-mlx
     whisper_language: str        # "th"
     silence_threshold: float = 0.01     # RMS speech threshold (~ -40 dBFS)
-    silence_seconds: float = 0.5        # trailing silence to close a chunk
-    min_chunk_seconds: float = 0.15     # shorter closed chunks are dropped
+    silence_seconds: float = 0.8        # trailing silence to close a chunk
+    min_chunk_seconds: float = 1.0      # shorter closed chunks are dropped
     max_chunk_seconds: float = 30.0     # force-close cap
-    summarize_timeout_seconds: float = 300.0  # SDK client timeout for gateway
+    summarize_timeout_seconds: float = 90.0  # SDK client timeout for gateway
     max_prompt_chars: int = 6000        # transcript truncation limit
     summary_max_tokens: int = 4096      # gateway output-token budget (qwen thinking)
 
@@ -99,10 +99,10 @@ def load_config(path: str | os.PathLike = ".env") -> Config:
         whisper_model=_required("WHISPER_MODEL"),
         whisper_language=_required("WHISPER_LANGUAGE"),
         silence_threshold=_optional_float("SILENCE_THRESHOLD", 0.01),
-        silence_seconds=_optional_float("SILENCE_SECONDS", 0.5),
-        min_chunk_seconds=_optional_float("MIN_CHUNK_SECONDS", 0.15),
+        silence_seconds=_optional_float("SILENCE_SECONDS", 0.8),
+        min_chunk_seconds=_optional_float("MIN_CHUNK_SECONDS", 1.0),
         max_chunk_seconds=_optional_float("MAX_CHUNK_SECONDS", 30.0),
-        summarize_timeout_seconds=_optional_float("SUMMARIZE_TIMEOUT_SECONDS", 300.0),
+        summarize_timeout_seconds=_optional_float("SUMMARIZE_TIMEOUT_SECONDS", 90.0),
         max_prompt_chars=int(_optional_float("MAX_PROMPT_CHARS", 6000.0)),
         summary_max_tokens=int(_optional_float("SUMMARY_MAX_TOKENS", 4096.0)),
     )
@@ -158,29 +158,44 @@ def doctor(cfg: Config) -> list[str]:
 
 
 def _gateway_probe_line(cfg: Config) -> str:
-    """Probe the gateway; never raises. The token is never logged."""
+    """Probe the gateway; never raises. The token is never logged.
+
+    The gateway is a self-hosted qwen *thinking* model, so even a
+    ``max_tokens=1`` probe can occasionally take >10 s (cold model load,
+    concurrent GPU load from the whisper stack). A slow-but-up gateway must not
+    fail ``--doctor``, so use a 30 s timeout and retry once on timeout only —
+    a `fail` now means the gateway is genuinely unreachable, not merely slow.
+    """
     if not cfg.anthropic_base_url or not cfg.anthropic_auth_token:
         return "fail: gateway probe skipped (missing base URL or auth token)"
     try:
         import anthropic
     except Exception as exc:  # noqa: BLE001
         return f"fail: anthropic not importable ({type(exc).__name__})"
-    try:
-        client = anthropic.Anthropic(
-            base_url=cfg.anthropic_base_url,
-            auth_token=cfg.anthropic_auth_token,
-            timeout=10.0,
-        )
-        response = client.messages.create(
-            model=cfg.gateway_model,
-            max_tokens=1,
-            messages=[{"role": "user", "content": "hi"}],
-        )
-    except Exception as exc:  # noqa: BLE001
-        status_code = getattr(exc, "status_code", None)
-        if status_code in (401, 403):
-            return "fail: gateway auth rejected (bad token)"
-        return f"fail: gateway probe failed ({type(exc).__name__})"
+    last_exc: Exception | None = None
+    for _attempt in range(2):  # 0 = first try, 1 = one timeout retry
+        try:
+            client = anthropic.Anthropic(
+                base_url=cfg.anthropic_base_url,
+                auth_token=cfg.anthropic_auth_token,
+                timeout=30.0,
+            )
+            response = client.messages.create(
+                model=cfg.gateway_model,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+            break
+        except anthropic.APITimeoutError as exc:  # transient slowness — try once more
+            last_exc = exc
+            continue
+        except Exception as exc:  # noqa: BLE001
+            status_code = getattr(exc, "status_code", None)
+            if status_code in (401, 403):
+                return "fail: gateway auth rejected (bad token)"
+            return f"fail: gateway probe failed ({type(exc).__name__})"
+    else:  # both attempts timed out
+        return f"fail: gateway probe timed out after 2 attempts ({type(last_exc).__name__})"
     # The SDK's Message response exposes the httpx status; default to 2xx if
     # it isn't reachable (older SDKs).
     try:

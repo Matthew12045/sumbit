@@ -70,6 +70,11 @@ class Summarizer:
             base_url=cfg.anthropic_base_url,   # e.g. https://gateway.9arm.co (no /v1)
             auth_token=cfg.anthropic_auth_token,
             timeout=cfg.summarize_timeout_seconds,
+            # Cap the SDK's internal 502/503/429 exponential backoff (up to
+            # ~60s per attempt by default) so a flaky self-hosted gateway can't
+            # hold the summarize thread for minutes. The app-level single
+            # APITimeoutError retry below still applies.
+            max_retries=1,
         )
 
     def summarize(self, transcript_text: str) -> str:

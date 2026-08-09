@@ -7,15 +7,18 @@ stays importable without the MLX stack installed.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass
 
 import numpy as np
 
 from .chunker import Segment
 from .transcript import TranscriptEvent
+from .wav_dump import dump_segment_wav
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +28,126 @@ _MAX_CHAR_RUN = 30      # any single char repeated > this many times => garbage
 _MAX_TOKEN_RATIO = 0.7  # most-frequent token / total tokens > this => garbage
 _MIN_TOKENS = 10        # only apply token-ratio check when there are enough tokens
 _MAX_REPEAT_PERIOD = 10  # characters; covers single chars up to short syllables/words
+
+
+# -- whisper decode settings + anti-loop retry ---------------------------
+#
+# mlx-whisper's built-in temperature fallback (decode_with_fallback) only
+# escalates when compression_ratio > 2.4 OR avg_logprob < -1.0. Confident
+# repetition loops fail BOTH checks (repetition compresses well -> LOW ratio;
+# each token is confident -> HIGH avg_logprob), so the fallback never fires and
+# the T=0 garbage survives. We therefore drive the escalation ourselves: a
+# suspicious primary decode (garbage, or whisper flagged no-speech) is re-decoded
+# ONCE with a small temperature bump + a Thai preamble to push the decoder off a
+# deterministic repetition attractor, and only dropped if the retry is still bad.
+#
+# Knobs are read from the environment (NOT Config) so the frozen Config
+# dataclass / .env.example key set / spec acceptance criterion 6 stay untouched.
+# WHISPER_FP16 must be constant for the whole process (ModelHolder caches the
+# model by path only, not dtype) — set it before the first decode and restart
+# to change it.
+
+
+@dataclass(frozen=True)
+class _DecodeSettings:
+    """Per-decode knobs passed through to ``mlx_whisper.transcribe``."""
+
+    temperature: float = 0.0
+    condition_on_previous_text: bool = False
+    initial_prompt: str | None = None
+    no_speech_threshold: float = 0.6
+    fp16: bool = True
+
+
+# Retry-only preamble: anchors a deterministic repetition attractor. Never
+# emitted in output (mlx decodes all_tokens[len(initial_prompt_tokens):]).
+_THAI_PREAMBLE = "ต่อไปนี้คือการประชุม: "
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_str(name: str, default: str) -> str:
+    """Unset env var -> *default*; a set var (even empty) -> its stripped value.
+
+    Unlike ``_env_bool``/``_env_float``, unset and set-empty must be
+    distinguishable here: ``WHISPER_INITIAL_PROMPT=""`` means "disable the
+    preamble", which the caller turns into None via ``... or None``.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip()
+
+
+def primary_decode_settings() -> _DecodeSettings:
+    """T=0 greedy, clean, unbiased. Same effective behavior as today except
+    ``condition_on_previous_text`` is now explicitly False."""
+    return _DecodeSettings(
+        temperature=0.0,
+        condition_on_previous_text=False,
+        initial_prompt=None,
+        no_speech_threshold=0.6,
+        fp16=_env_bool("WHISPER_FP16", True),
+    )
+
+
+def retry_decode_settings() -> _DecodeSettings:
+    """Anti-loop retry: small temperature bump + Thai preamble to push the
+    decoder off a deterministic greedy attractor. ``fp16`` must match the
+    primary decode (ModelHolder caches the model by path, not dtype)."""
+    return _DecodeSettings(
+        temperature=_env_float("WHISPER_RETRY_TEMPERATURE", 0.2),
+        condition_on_previous_text=False,
+        initial_prompt=_env_str("WHISPER_INITIAL_PROMPT", _THAI_PREAMBLE) or None,
+        no_speech_threshold=0.6,
+        fp16=_env_bool("WHISPER_FP16", True),
+    )
+
+
+def build_decode_kwargs(settings: _DecodeSettings, *, language: str) -> dict:
+    """Translate :class:`_DecodeSettings` into mlx_whisper ``transcribe`` kwargs."""
+    kwargs: dict = {
+        "language": language,
+        "temperature": settings.temperature,
+        "condition_on_previous_text": settings.condition_on_previous_text,
+        "no_speech_threshold": settings.no_speech_threshold,
+        "fp16": settings.fp16,
+    }
+    if settings.initial_prompt:
+        kwargs["initial_prompt"] = settings.initial_prompt
+    return kwargs
+
+
+def should_retry(
+    text: str,
+    no_speech_prob: float,
+    *,
+    no_speech_threshold: float = 0.6,
+) -> bool:
+    """True when a decode should be retried once: text present AND either the
+    garbage filter fired or whisper flagged the window as no-speech.
+
+    Empty (or whitespace-only) text stays a terminal drop (current behavior) —
+    it costs nothing to skip retrying a genuinely empty window.
+    """
+    if not text.strip():
+        return False
+    return is_garbage_transcription(text) or no_speech_prob > no_speech_threshold
 
 
 def _max_repeat_run_length(text: str, max_period: int = _MAX_REPEAT_PERIOD) -> int:
@@ -188,42 +311,93 @@ class Transcriber:
         # every pipeline stage.
         assert samples.dtype == np.float32, "transcriber requires float32 mono audio"
         assert samples.ndim == 1, "transcriber requires 1-D mono audio"
+
+        # Diagnostic: dump exactly what whisper will receive (env-gated).
+        dump_segment_wav(
+            segment.speaker_name or segment.speaker_key,
+            segment.start,
+            segment.duration,
+            samples,
+        )
+
         log.info("transcribing segment: speaker=%s start=%.2f dur=%.2f samples=%d dtype=%s min=%.6f max=%.6f mean=%.6f",
                  segment.speaker_name or segment.speaker_key, segment.start, segment.duration, len(samples),
                  samples.dtype, samples.min(), samples.max(), samples.mean())
+
+        primary = self._decode(samples, primary_decode_settings())
+        if primary is None:
+            log.warning("transcription returned empty text for segment")
+            return None
+        text, no_speech_prob, _ = primary
+
+        if not should_retry(text, no_speech_prob):
+            return self._event(segment, text)
+
+        # One bounded anti-loop retry on the SAME audio. Whisper's own fallback
+        # never fires for confident loops (repetition compresses well, tokens
+        # are high-confidence), so we drive the escalation ourselves.
+        log.info(
+            "primary decode suspicious (garbage=%s no_speech_prob=%.4f) — retrying once",
+            is_garbage_transcription(text),
+            no_speech_prob,
+        )
+        retry = self._decode(samples, retry_decode_settings())
+        if retry is None:
+            log.warning(
+                "anti-loop retry returned empty text — dropping segment (primary=%r)",
+                text[:120],
+            )
+            return None
+        rtext, r_nsp, _ = retry
+        if not should_retry(rtext, r_nsp):
+            log.info(
+                "recovered after anti-loop retry: primary=%r retry=%r no_speech_prob=%.4f",
+                text[:60],
+                rtext[:120],
+                r_nsp,
+            )
+            return self._event(segment, rtext)
+        log.warning(
+            "still garbage after anti-loop retry — dropping segment "
+            "(primary=%r retry=%r no_speech_prob=%.4f)",
+            text[:120],
+            rtext[:120],
+            r_nsp,
+        )
+        return None
+
+    def _decode(
+        self,
+        samples: np.ndarray,
+        settings: _DecodeSettings,
+    ) -> tuple[str, float, list] | None:
+        """One mlx-whisper decode returning ``(text, no_speech_prob, segs)``.
+
+        Returns None when the decode produced empty text (a terminal drop).
+        """
         result = self._mlx_whisper.transcribe(
             samples,
             path_or_hf_repo=self.model,
-            language=self.language,
+            **build_decode_kwargs(settings, language=self.language),
         )
         text = (result.get("text") or "").strip()
 
         # Extract no_speech_prob from the first segment for quality gating.
         segs = result.get("segments") or []
         no_speech_prob = segs[0].get("no_speech_prob", 0.0) if segs else 0.0
-        log.info("transcription result: text=%r segments=%d no_speech_prob=%.4f",
-                 text, len(segs), no_speech_prob)
-
+        log.info(
+            "transcription result (temperature=%.2f): text=%r segments=%d no_speech_prob=%.4f",
+            settings.temperature,
+            text[:120],
+            len(segs),
+            no_speech_prob,
+        )
         if not text:
-            log.warning("transcription returned empty text for segment")
             return None
+        return text, no_speech_prob, segs
 
-        # Gate: whisper is telling us this isn't speech.
-        if no_speech_prob > 0.6:
-            log.warning(
-                "dropping segment: high no_speech_prob=%.4f (text=%r)",
-                no_speech_prob, text[:120],
-            )
-            return None
-
-        # Gate: detect whisper hallucination on noise/encrypted audio.
-        if is_garbage_transcription(text):
-            log.warning(
-                "dropping segment: garbage transcription detected (text[:120]=%r)",
-                text[:120],
-            )
-            return None
-
+    @staticmethod
+    def _event(segment: Segment, text: str) -> TranscriptEvent:
         return TranscriptEvent(
             speaker=segment.speaker_name or segment.speaker_key,
             start=segment.start,

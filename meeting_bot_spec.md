@@ -23,8 +23,8 @@ Discord voice channel
 
 1. **Voice receive:** py-cord pinned to the DAVE-patched unmerged branch — released 2.8.1's voice reception is buggy under Discord's DAVE encryption (py-cord issue #3139); the fix reworks per-user receive. `requirements.txt` must pin the **exact commit** `git+https://github.com/Pycord-Development/pycord.git@326b72acc8d1d952ac002fe07ca65581cf5952bc` (branch `fix/voice-rec-2`; a moving-branch pin is not reproducible). Do not substitute released 2.8.1 — receive will be broken.
 
-   **macOS prerequisite:** `brew install opus` is required for voice (py-cord ships libopus only as Windows DLLs). The bot's `doctor()` checks `ctypes.util.find_library("opus")`. First whisper run downloads ~1.6 GB into `~/.cache/huggingface` (host default is fine; set `HF_HOME` only if the cache must live elsewhere).
-2. **STT:** local `mlx-whisper`, model `mlx-community/whisper-large-v3-turbo`, `language="th"`. No cloud API. Runs on the same Apple Silicon MacBook as the AI gateway, so GPU contention is a real concern — serialized worker, fp16, model cached once.
+   **macOS prerequisite:** `brew install opus` is required for voice (py-cord ships libopus only as Windows DLLs). The bot's `doctor()` checks `ctypes.util.find_library("opus")`. First whisper run downloads ~3 GB into `~/.cache/huggingface` (host default is fine; set `HF_HOME` only if the cache must live elsewhere).
+2. **STT:** local `mlx-whisper`, model `mlx-community/whisper-large-v3-mlx` (non-turbo — large-v3-turbo is prone to confident repetition-loop hallucinations on Thai), `language="th"`. No cloud API. Runs on the same Apple Silicon MacBook as the AI gateway, so GPU contention is a real concern — serialized worker, fp16, model cached once. The transcriber hardens the decode (`condition_on_previous_text=False`, greedy T=0) and re-decodes once with a small temperature bump + Thai preamble when a decode is flagged garbage; see `tools/offline_repro.py` for an A/B harness.
 3. **Summarization:** the user's own gateway via the **Anthropic-compatible** API — `anthropic` SDK, `base_url=https://gateway.9arm.co`, `auth_token` from env (`ANTHROPIC_AUTH_TOKEN`), model `qwen3.6-35b-a3b`. **Do not put `/v1` in the base URL** (the SDK appends `/v1/messages`). qwen's structured-output reliability is the known risk — the summary parse must never raise.
 4. **Secrets/config:** `.env` (never committed) via python-dotenv. A `.env.example` mirrors every key with placeholders and comments, no real secrets.
 
@@ -54,7 +54,7 @@ requirements.txt
 .env.example
 ```
 
-**Import rule (load-bearing).** `config.py`, `audio.py`, `chunker.py`, `transcript.py`, `summary_parse.py` must import **only stdlib + numpy** at module scope. `summarizer.py` imports `anthropic` lazily (inside `__init__`/methods, not at module scope). `sink.py`, `bot.py`, `poster.py` may import `discord`. `config.py` imports `dotenv`/`load_dotenv` **inside `load_config()` only** — python-dotenv is neither stdlib nor numpy, so a module-scope import breaks the pure-import rule. This lets the pure modules be imported and tested without the heavy deps installed.
+**Import rule (load-bearing).** `config.py`, `audio.py`, `chunker.py`, `transcript.py`, `summary_parse.py`, `wav_dump.py` must import **only stdlib + numpy** at module scope (`wav_dump.py` is stdlib-only). `summarizer.py` imports `anthropic` lazily (inside `__init__`/methods, not at module scope). `sink.py`, `bot.py`, `poster.py` may import `discord`. `config.py` imports `dotenv`/`load_dotenv` **inside `load_config()` only** — python-dotenv is neither stdlib nor numpy, so a module-scope import breaks the pure-import rule. This lets the pure modules be imported and tested without the heavy deps installed.
 
 ## Module contracts
 
@@ -69,7 +69,7 @@ class Config:
     anthropic_base_url: str      # no trailing /v1
     anthropic_auth_token: str
     gateway_model: str           # qwen3.6-35b-a3b
-    whisper_model: str           # mlx-community/whisper-large-v3-turbo
+    whisper_model: str           # mlx-community/whisper-large-v3-mlx
     whisper_language: str        # "th"
     silence_threshold: float = 0.01     # RMS speech threshold (−40 dBFS)
     silence_seconds: float = 0.8        # trailing silence to close a chunk
@@ -79,7 +79,7 @@ class Config:
 def load_config(path: str | os.PathLike = ".env") -> Config: ...
 def doctor(cfg: Config) -> list[str]:   # list of "ok: ..."/"fail: ..." lines
 ```
-`load_config` reads `.env` with `python-dotenv` (imported inside the function), validates required keys present and non-empty, raises a clear error naming the missing key. `doctor` returns one `ok: ...`/`fail: ...` line per check and **never raises**: all required keys present; `discord`/`mlx_whisper`/`anthropic`/`numpy` importable (each individually — a missing one is a `fail` line, not an exception); system `libopus` resolvable via `ctypes.util.find_library("opus")`; whisper model name non-empty; and a **gateway probe**: construct the anthropic client from cfg and call `messages.create(model=cfg.gateway_model, max_tokens=1)` with a ~10 s timeout — `ok` iff no exception and HTTP 2xx, `fail` on 401/403 (bad token) or network error, `fail` (not an exception) if `anthropic` isn't installed. Never log the auth token.
+`load_config` reads `.env` with `python-dotenv` (imported inside the function), validates required keys present and non-empty, raises a clear error naming the missing key. `doctor` returns one `ok: ...`/`fail: ...` line per check and **never raises**: all required keys present; `discord`/`mlx_whisper`/`anthropic`/`numpy` importable (each individually — a missing one is a `fail` line, not an exception); system `libopus` resolvable via `ctypes.util.find_library("opus")`; whisper model name non-empty; and a **gateway probe**: construct the anthropic client from cfg and call `messages.create(model=cfg.gateway_model, max_tokens=1)` with a 30 s timeout and one retry on timeout only (the self-hosted qwen thinking model can exceed 10 s on cold load, so a slow-but-up gateway must not fail the check) — `ok` iff no exception and HTTP 2xx, `fail` on 401/403 (bad token), network error, or two consecutive timeouts, `fail` (not an exception) if `anthropic` isn't installed. Never log the auth token.
 
 ### `audio.py` (pure numpy)
 ```python
@@ -136,7 +136,7 @@ class Transcriber:
     def stop(self, flush: bool = True) -> None: ...
     def drain(self, timeout: float = 5.0) -> list[TranscriptionEvent]: ...
 ```
-One worker thread pulls segments, calls `mlx_whisper.transcribe(samples_array, path_or_hf_repo=model, language=language)["text"]`, and pushes `TranscriptionEvent(speaker, start, text)` onto the output queue. Passing a numpy array skips ffmpeg (input is 16 kHz mono f32). Load the model once and reuse (the MLX `ModelHolder` caches it). Serializes MLX so the GPU isn't contended with the gateway. If `mlx_whisper` import fails at construction, raise a clear error. **Right before transcribing, assert the array is exactly 16 kHz mono float32** (e.g. `assert samples.dtype == np.float32 and samples.ndim == 1` and the rate is 16000) — mlx-whisper does **not** validate or resample array input; wrong rate/dtype silently yields garbage, so a pipeline regression must fail loudly instead. `stop(flush=True)` drains the input queue to completion before the worker exits (so a flushed trailing chunk is transcribed, not dropped); `drain(timeout)` waits up to `timeout` for pending transcriptions to land on the output queue and returns them. `_finalize` calls `stop(flush=True)` (or `drain`) before building the transcript.
+One worker thread pulls segments, optionally dumps the audio to `.wav` (`DUMP_CHUNKS_DIR`, env-gated — see `meeting_bot/wav_dump.py`), and calls `mlx_whisper.transcribe(samples_array, path_or_hf_repo=model, **kwargs)["text"]`, pushing `TranscriptionEvent(speaker, start, text)` onto the output queue. The decode kwargs harden against repetition-loop hallucinations: **greedy `temperature=0`, `condition_on_previous_text=False`, `no_speech_threshold=0.6`, `fp16` (env toggle `WHISPER_FP16`)**. mlx-whisper's own temperature fallback cannot catch confident loops (they compress well and are high-confidence, so `compression_ratio > 2.4` / `avg_logprob < -1.0` never fire), so a suspicious primary decode — garbage per `is_garbage_transcription`, or `no_speech_prob` above threshold — is re-decoded **once** with a small temperature bump (`WHISPER_RETRY_TEMPERATURE`, default 0.2) + Thai preamble (`WHISPER_INITIAL_PROMPT`, default `"ต่อไปนี้คือการประชุม: "`, empty disables) and only dropped if the retry is still bad. See `tools/offline_repro.py` for the A/B harness. Passing a numpy array skips ffmpeg (input is 16 kHz mono f32). Load the model once and reuse (the MLX `ModelHolder` caches it; `fp16` must therefore be constant per process). Serializes MLX so the GPU isn't contended with the gateway. If `mlx_whisper` import fails at construction, raise a clear error. **Right before transcribing, assert the array is exactly 16 kHz mono float32** (e.g. `assert samples.dtype == np.float32 and samples.ndim == 1` and the rate is 16000) — mlx-whisper does **not** validate or resample array input; wrong rate/dtype silently yields garbage, so a pipeline regression must fail loudly instead. `stop(flush=True)` drains the input queue to completion before the worker exits (so a flushed trailing chunk is transcribed, not dropped); `drain(timeout)` waits up to `timeout` for pending transcriptions to land on the output queue and returns them. `_finalize` calls `stop(flush=True)` (or `drain`) before building the transcript.
 
 ### `transcript.py` (pure stdlib)
 ```python
@@ -247,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
 - `test_chunker.py`: [silence, 2 s tone, silence] → exactly one Segment with correct speaker/timestamps; sub-`min_chunk_seconds` blip dropped; continuous > `max_chunk_seconds` forced into multiple segments; `flush()` closes trailing partial.
 - `test_transcript.py`: `to_prompt_text()` ordering + `[MM:SS]` format; `is_empty()`.
 - `test_summary_parse.py`: valid JSON → Summary; fenced JSON → parses; markdown sections → fallback; English-key JSON → parses; garbage → non-raising last resort.
+- `test_transcriber.py`: `is_garbage_transcription` heuristics (long char runs, token-ratio, Thai no-whitespace repetition); Thai politeness particles (`ครับ ครับ ครับ`, `ค่ะ ค่ะ`) never flagged; `should_retry` (garbage → retry, high `no_speech_prob` → retry, empty/whitespace → never, threshold is strictly `>`); `build_decode_kwargs` primary (T=0, `condition_on_previous_text=False`, no prompt) vs retry (temperature > 0, Thai preamble); env toggles `WHISPER_FP16`/`WHISPER_RETRY_TEMPERATURE`/`WHISPER_INITIAL_PROMPT`.
+- `test_wav_dump.py`: inert when `DUMP_CHUNKS_DIR` unset; writes well-formed 16 kHz mono 16-bit PCM; float32→int16 clamp; filename sanitization + zero-padded sort.
 
 ## `requirements.txt` (pin exactly)
 
@@ -271,18 +273,21 @@ TARGET_CHANNEL_ID=   # text channel that receives the summary
 ANTHROPIC_BASE_URL=https://gateway.9arm.co
 ANTHROPIC_AUTH_TOKEN=sk-...   # gateway bearer token
 GATEWAY_MODEL=qwen3.6-35b-a3b
-WHISPER_MODEL=mlx-community/whisper-large-v3-turbo
+WHISPER_MODEL=mlx-community/whisper-large-v3-mlx
 WHISPER_LANGUAGE=th
 SILENCE_THRESHOLD=0.01
 SILENCE_SECONDS=0.8
 MIN_CHUNK_SECONDS=1.0
 MAX_CHUNK_SECONDS=30.0
+SUMMARIZE_TIMEOUT_SECONDS=90
+MAX_PROMPT_CHARS=6000
+SUMMARY_MAX_TOKENS=4096
 ```
 
 ## Acceptance criteria
 
 1. `python3 -m compileall -q meeting_bot tests` exits 0.
-2. The five pure modules (`config`, `audio`, `chunker`, `transcript`, `summary_parse`) import with only numpy present (no discord/anthropic/mlx_whisper).
+2. The six pure modules (`config`, `audio`, `chunker`, `transcript`, `summary_parse`, `wav_dump`) import with only numpy present (no discord/anthropic/mlx_whisper; `wav_dump` needs nothing but stdlib).
 3. Every class/function above exists with the documented signature.
 4. `main.py` supports `--doctor` and `--help` without connecting.
 5. No tokens or secrets appear in any file.

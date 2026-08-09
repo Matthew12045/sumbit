@@ -1,8 +1,21 @@
-"""Pure-logic tests for meeting_bot.transcriber garbage detection
-(no mlx-whisper / Discord / network).
+"""Pure-logic tests for meeting_bot.transcriber garbage detection + the
+anti-loop decode settings (no mlx-whisper / Discord / network).
 """
 
-from meeting_bot.transcriber import is_garbage_transcription
+from meeting_bot.transcriber import (
+    build_decode_kwargs,
+    is_garbage_transcription,
+    primary_decode_settings,
+    retry_decode_settings,
+    should_retry,
+)
+
+
+def _clear_env(monkeypatch) -> None:
+    """Make decode-settings tests deterministic regardless of shell env."""
+    monkeypatch.delenv("WHISPER_FP16", raising=False)
+    monkeypatch.delenv("WHISPER_RETRY_TEMPERATURE", raising=False)
+    monkeypatch.delenv("WHISPER_INITIAL_PROMPT", raising=False)
 
 
 class TestIsGarbageTranscription:
@@ -92,3 +105,83 @@ class TestIsGarbageTranscription:
         # token, below _MIN_TOKENS. Generalized run check catches it.
         text = "ตาม" * 111
         assert is_garbage_transcription(text)
+
+
+class TestThaiParticlesPass:
+    """Legitimate Thai politeness particles must never be flagged garbage.
+
+    These are the exact repeated-particle patterns that could otherwise be
+    mistaken for whisper repetition loops now that the retry path keys off
+    :func:`should_retry` (a false positive costs a wasted re-decode).
+    """
+
+    def test_krub_spaced(self) -> None:
+        assert not is_garbage_transcription("ครับ ครับ ครับ ครับ")
+
+    def test_ka_spaced(self) -> None:
+        assert not is_garbage_transcription("ค่ะ ค่ะ ค่ะ")
+
+    def test_percent_krub(self) -> None:
+        assert not is_garbage_transcription("100% ครับ")
+
+    def test_krub_run_no_whitespace(self) -> None:
+        # "ครับครับครับ" — the 12-char run (period 4 × 3) is well under
+        # _MAX_CHAR_RUN (30) and the single whitespace token is below
+        # _MIN_TOKENS, so neither heuristic fires.
+        assert not is_garbage_transcription("ครับครับครับ")
+
+
+class TestShouldRetry:
+    """The retry trigger: garbage OR whisper's no-speech flag, never empty."""
+
+    def test_garbage_retries(self) -> None:
+        assert should_retry("ตาม" * 111, 0.0)
+
+    def test_clean_high_no_speech_retries(self) -> None:
+        assert should_retry("สวัสดีครับ วันนี้เรามีประชุม", 0.9)
+
+    def test_clean_low_no_speech_no_retry(self) -> None:
+        assert not should_retry("สวัสดีครับ วันนี้เรามีประชุม", 0.1)
+
+    def test_empty_text_never_retries(self) -> None:
+        # High no_speech alone must not resurrect a genuinely empty window.
+        assert not should_retry("", 0.9)
+        assert not should_retry("   ", 0.9)
+
+    def test_boundary_no_speech_threshold_exclusive(self) -> None:
+        # Strictly > threshold; 0.6 exactly is not a retry.
+        assert not should_retry("สวัสดีครับ", 0.6)
+
+
+class TestDecodeSettings:
+    """build_decode_kwargs reflects primary vs retry behavior."""
+
+    def test_primary_is_greedy_and_unbiased(self, monkeypatch) -> None:
+        _clear_env(monkeypatch)
+        kwargs = build_decode_kwargs(primary_decode_settings(), language="th")
+        assert kwargs["language"] == "th"
+        assert kwargs["temperature"] == 0.0
+        assert kwargs["condition_on_previous_text"] is False
+        assert kwargs["no_speech_threshold"] == 0.6
+        assert kwargs["fp16"] is True
+        assert "initial_prompt" not in kwargs
+
+    def test_retry_bumps_temperature_and_adds_preamble(self, monkeypatch) -> None:
+        _clear_env(monkeypatch)
+        kwargs = build_decode_kwargs(retry_decode_settings(), language="th")
+        assert kwargs["temperature"] > 0.0
+        assert kwargs["condition_on_previous_text"] is False
+        assert kwargs["fp16"] is True  # must match primary (model cached by path)
+        assert kwargs["initial_prompt"].strip()  # Thai preamble present
+
+    def test_fp16_env_toggle(self, monkeypatch) -> None:
+        monkeypatch.setenv("WHISPER_FP16", "0")
+        assert primary_decode_settings().fp16 is False
+
+    def test_retry_temperature_env_toggle(self, monkeypatch) -> None:
+        monkeypatch.setenv("WHISPER_RETRY_TEMPERATURE", "0.5")
+        assert retry_decode_settings().temperature == 0.5
+
+    def test_empty_initial_prompt_env_disables_preamble(self, monkeypatch) -> None:
+        monkeypatch.setenv("WHISPER_INITIAL_PROMPT", "")
+        assert retry_decode_settings().initial_prompt is None
