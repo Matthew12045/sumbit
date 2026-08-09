@@ -241,6 +241,11 @@ class Summarizer:
                 item = q.get(timeout=self.cfg.stall_timeout_seconds)
             except queue.Empty:
                 stop.set()
+                log.warning(
+                    "stall: %d chars streamed so far (progressed=%s), "
+                    "last 200 chars: %r",
+                    len(buf), progressed, buf[-200:],
+                )
                 raise StalledGenerationError(
                     f"no new content for {self.cfg.stall_timeout_seconds:.0f}s",
                     progressed=progressed,
