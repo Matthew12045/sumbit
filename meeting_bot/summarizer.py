@@ -4,38 +4,34 @@
 import rule intact (config/audio/chunker/transcript/summary_parse import only
 stdlib + numpy at module scope).
 
-Redesign notes (2026-08-10): summarization now streams instead of blocking on
-a single ``messages.create()`` call. qwen is a thinking model that can loop
-instead of terminating (see ``EmptySummaryError``); streaming lets us detect
-that live -- via a stall timeout and an exact-repeat check on the generated
-text -- and abort in tens of seconds instead of riding out the full
-``summarize_timeout_seconds`` ceiling.
+Design notes (2026-08-10): probed against the real gateway
+(``tools/probe_stream.py``), gateway.9arm.co does NOT stream incrementally in
+a way a live watchdog can use. It emits zero ``thinking_delta`` events during
+the entire (silent) thinking phase, then streams the final ``text`` block in
+a sub-second burst just before ``message_stop``; the pre-``message_start``
+delay alone can exceed 20s on a cold run. So the streaming stall/repetition
+guards could never fire early -- any thinking phase longer than
+``STALL_TIMEOUT_SECONDS`` aborted a perfectly healthy generation. We reverted
+to a plain blocking ``client.messages.create()`` call and rely on the SDK
+client timeout (``SUMMARIZE_TIMEOUT_SECONDS``) as the ceiling.
 
-The old "retry once on any timeout" policy is gone. A stall/timeout AFTER
-real output had started is NOT retried: retrying an identical
-temperature=0.0 prompt against the same stuck reasoning trace is very likely
-to reproduce it, so paying for a second full wait buys nothing. We still
-retry once for a stall/timeout that produced literally zero bytes, which is
-the "gateway hiccuped, no generation ever started" case -- a genuine
-transient failure, not a reproducible pathology.
+The exact-repeat loop check is kept, but now runs POST-HOC on the completed
+output (thinking + text) instead of live during streaming: qwen is a thinking
+model that can loop instead of terminating, and a completed message whose
+output is an exact-repeat loop is still worthless and would confuse the JSON
+parser. A detected loop raises ``StalledGenerationError(progressed=True)`` so
+``bot.py``'s existing ⚠️ handler fires.
 
-ASSUMPTION TO VERIFY BEFORE SHIPPING: this relies on the self-hosted gateway
-(gateway.9arm.co) correctly implementing SSE streaming for
-``messages.stream()`` -- i.e. emitting real ``content_block_delta`` events
-(including ``thinking_delta`` for qwen's reasoning trace) rather than just
-buffering the whole completion and returning it once at the end. If it does
-the latter, stall/repetition detection never gets a chance to fire early
-(the first "event" IS the finished response) and this whole mechanism
-degrades to "wait for the full call, then check once" -- not wrong, but not
-the improvement described above. Confirm with a raw probe against the
-gateway before relying on this in production.
+Retry policy: retry once on ``APITimeoutError`` only -- the "gateway
+hiccuped, no response ever started" transient case. ``EmptySummaryError``
+(model spent its whole token budget on reasoning) and
+``StalledGenerationError`` (loop) are never retried: re-running
+temperature=0.0 against the same reasoning trace would reproduce them.
 """
 
 from __future__ import annotations
 
 import logging
-import queue
-import threading
 import time
 
 from .config import Config
@@ -95,12 +91,12 @@ class EmptySummaryError(RuntimeError):
 
 
 class StalledGenerationError(RuntimeError):
-    """Streaming produced no new content for ``stall_timeout_seconds``, or
-    detected an exact-repeat loop in the generated text.
+    """A completed summary was rejected because its output is an exact-repeat
+    loop.
 
-    ``progressed`` records whether *any* content had streamed before the
-    stall/loop fired -- the caller uses this to decide whether a retry is
-    worth the wait (see module docstring).
+    ``progressed`` is always True here: the check is post-hoc on the completed
+    message, so content always existed. It is kept as a keyword arg so the
+    exception's shape matches what ``bot.py`` and tests already expect.
     """
 
     def __init__(self, message: str, *, progressed: bool):
@@ -140,11 +136,6 @@ def _is_looping(buf: str, window: int, min_repeats: int) -> bool:
     )
 
 
-# Tags the pump thread puts on the queue alongside terminal payloads.
-_DONE = "__done__"
-_ERROR = "__error__"
-
-
 class Summarizer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -159,144 +150,110 @@ class Summarizer:
             base_url=cfg.anthropic_base_url,   # e.g. https://gateway.9arm.co (no /v1)
             auth_token=cfg.anthropic_auth_token,
             timeout=cfg.summarize_timeout_seconds,
-            # Backstop only now -- stall detection below should always fire
-            # first. Our own summarize() loop below owns the one no-progress
-            # retry, so the SDK's internal 429/5xx retry is disabled to avoid
-            # stacking two independent retry policies on top of each other.
+            # Backstop only now -- our own summarize() loop below owns the one
+            # APITimeoutError retry, so the SDK's internal 429/5xx retry is
+            # disabled to avoid stacking two independent retry policies on top
+            # of each other.
             max_retries=0,
         )
 
     def summarize(self, transcript_text: str) -> str:
         """Blocking call (intended to run via ``asyncio.to_thread``).
 
-        Retries once, but ONLY when the previous attempt produced zero
-        streamed bytes before failing. See module docstring for why a
-        stall/timeout after real output started is not retried.
+        Retries once, but ONLY on ``APITimeoutError`` -- the "gateway
+        hiccuped, no response ever started" transient case.
+        ``EmptySummaryError`` (the model spent its whole token budget on
+        reasoning) and ``StalledGenerationError`` (post-hoc repetition-loop
+        detection) are never retried: re-running temperature=0.0 against the
+        same reasoning trace would reproduce them.
         """
         last_exc: Exception | None = None
-        for attempt in range(2):  # 0 = first try, 1 = one no-progress retry
+        for attempt in range(2):  # 0 = first try, 1 = one timeout retry
             try:
                 return self._summarize_once(transcript_text)
-            except StalledGenerationError as exc:
-                last_exc = exc
-                if exc.progressed or attempt == 1:
-                    raise
-                log.warning("stalled with zero output, retrying once...")
-                time.sleep(2.0)
-                continue
+            except EmptySummaryError:
+                raise  # never retried -- see docstring
+            except StalledGenerationError:
+                raise  # post-hoc loop, always progressed=True -- never retried
             except self._anthropic.APITimeoutError as exc:
                 last_exc = exc
                 if attempt == 1:
                     raise
                 log.warning(
                     "summarizer connection timed out after %.0fs with no "
-                    "stream ever starting, retrying in 2s...",
+                    "response ever starting, retrying in 2s...",
                     self.cfg.summarize_timeout_seconds,
                 )
                 time.sleep(2.0)
                 continue
-            # EmptySummaryError and anything else: not retried.
+            # Anything else: not retried.
         raise last_exc  # type: ignore[misc]  # pragma: no cover
 
     def _summarize_once(self, transcript_text: str) -> str:
-        """Stream one summarization call, enforcing a stall/repetition guard.
+        """Run one blocking summarization call (no streaming).
 
-        The SDK's blocking stream iteration runs on a background thread and
-        is drained here via a queue with a timeout -- that's what lets us
-        detect "no new event for N seconds" even though the iterator itself
-        blocks on network I/O and can't be timed out directly from the
-        consuming side.
+        The gateway buffers the whole completion server-side and returns it
+        in a single response, so streaming buys nothing (see module
+        docstring): we rely on the SDK client timeout
+        (``SUMMARIZE_TIMEOUT_SECONDS``) as the ceiling, and run the exact-
+        repeat loop check post-hoc on the completed output instead of live
+        during generation.
         """
-        q: "queue.Queue[object]" = queue.Queue()
-        stop = threading.Event()
-
-        def _pump() -> None:
-            try:
-                with self._client.messages.stream(
-                    model=self.cfg.gateway_model,
-                    max_tokens=self.cfg.summary_max_tokens,
-                    temperature=0.0,
-                    system=_SYSTEM_PROMPT,
-                    messages=[
-                        {"role": "user", "content": transcript_text + _USER_SUFFIX}
-                    ],
-                ) as stream:
-                    for event in stream:
-                        if stop.is_set():
-                            return
-                        q.put(event)
-                    q.put((_DONE, stream.get_final_message()))
-            except Exception as exc:  # noqa: BLE001
-                q.put((_ERROR, exc))
-
-        pump = threading.Thread(target=_pump, daemon=True)
-        pump.start()
-
-        buf = ""  # accumulated thinking/text so far; loop-detected either way
-        progressed = False
-        final_message = None
-
-        while final_message is None:
-            try:
-                item = q.get(timeout=self.cfg.stall_timeout_seconds)
-            except queue.Empty:
-                stop.set()
-                log.warning(
-                    "stall: %d chars streamed so far (progressed=%s), "
-                    "last 200 chars: %r",
-                    len(buf), progressed, buf[-200:],
-                )
-                raise StalledGenerationError(
-                    f"no new content for {self.cfg.stall_timeout_seconds:.0f}s",
-                    progressed=progressed,
-                )
-
-            if isinstance(item, tuple):
-                tag, payload = item
-                if tag == _ERROR:
-                    raise payload
-                final_message = payload  # tag == _DONE
-                break
-
-            event = item
-            if getattr(event, "type", "") == "content_block_delta":
-                delta = event.delta
-                piece = getattr(delta, "text", None) or getattr(delta, "thinking", None)
-                if piece:
-                    progressed = True
-                    buf += piece
-                    if _is_looping(
-                        buf,
-                        self.cfg.repetition_window_chars,
-                        self.cfg.repetition_min_repeats,
-                    ):
-                        stop.set()
-                        raise StalledGenerationError(
-                            "generation is repeating (loop detected)",
-                            progressed=True,
-                        )
-
-        pump.join(timeout=5.0)
+        message = self._client.messages.create(
+            model=self.cfg.gateway_model,
+            max_tokens=self.cfg.summary_max_tokens,
+            temperature=0.0,
+            system=_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": transcript_text + _USER_SUFFIX}
+            ],
+        )
 
         text = "".join(
-            block.text for block in final_message.content
+            block.text for block in message.content
             if getattr(block, "type", "") == "text"
         )
         if not text.strip():
             block_types = [
-                getattr(block, "type", "?") for block in final_message.content
+                getattr(block, "type", "?") for block in message.content
             ]
             log.warning(
                 "summarizer returned no text (stop_reason=%s, blocks=%s, "
                 "non-text chars=%d) -- the model likely spent its whole "
                 "token budget on reasoning; try raising SUMMARY_MAX_TOKENS "
                 "in .env",
-                getattr(final_message, "stop_reason", "unknown"),
+                getattr(message, "stop_reason", "unknown"),
                 block_types,
-                _non_text_char_count(final_message.content),
+                _non_text_char_count(message.content),
             )
             raise EmptySummaryError(
                 "gateway returned no text (stop_reason=%s, blocks=%s)"
-                % (getattr(final_message, "stop_reason", "unknown"), block_types)
+                % (getattr(message, "stop_reason", "unknown"), block_types)
+            )
+
+        # Post-hoc loop detection. Mirror the old streaming buffer's scope:
+        # qwen's thinking trace can loop without terminating, so check the
+        # combined thinking + text output, not just the final text.
+        buf = ""
+        for block in message.content:
+            btype = getattr(block, "type", "")
+            if btype == "text":
+                buf += getattr(block, "text", "")
+            elif btype == "thinking":
+                buf += getattr(block, "thinking", "")
+        if _is_looping(
+            buf,
+            self.cfg.repetition_window_chars,
+            self.cfg.repetition_min_repeats,
+        ):
+            log.warning(
+                "summarizer completed but output is an exact-repeat loop "
+                "(window=%d x%d) -- posting a failure note",
+                self.cfg.repetition_window_chars,
+                self.cfg.repetition_min_repeats,
+            )
+            raise StalledGenerationError(
+                "generation is repeating (loop detected on completed text)",
+                progressed=True,
             )
         return text

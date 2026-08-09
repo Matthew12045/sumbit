@@ -61,29 +61,46 @@ def test_stalled_generation_error_tracks_progressed():
 def _make_summarizer() -> sm.Summarizer:
     """Build a Summarizer without touching anthropic (bypass __init__)."""
     s = object.__new__(sm.Summarizer)
-    s.cfg = None  # unused by the retry loop
+    s.cfg = SimpleNamespace(summarize_timeout_seconds=180.0)
     s._anthropic = SimpleNamespace(APITimeoutError=RuntimeError)
     s._client = None
     return s
 
 
-def test_zero_progress_stall_retries_once_then_raises(monkeypatch):
+def test_api_timeout_retries_once_then_raises(monkeypatch):
     monkeypatch.setattr(sm.time, "sleep", lambda _seconds: None)
     s = _make_summarizer()
     calls: list[str] = []
 
     def fake_once(text: str) -> str:
         calls.append(text)
-        raise StalledGenerationError("stalled", progressed=False)
+        raise RuntimeError  # stands in for anthropic.APITimeoutError
 
     s._summarize_once = fake_once
-    with pytest.raises(StalledGenerationError):
+    with pytest.raises(RuntimeError):
         s.summarize("t")
     # First attempt + one retry, then give up.
     assert len(calls) == 2
 
 
-def test_progressed_stall_raises_without_retry(monkeypatch):
+def test_emptysummary_error_never_retries(monkeypatch):
+    monkeypatch.setattr(sm.time, "sleep", lambda _seconds: None)
+    s = _make_summarizer()
+    calls: list[str] = []
+
+    def fake_once(text: str) -> str:
+        calls.append(text)
+        raise sm.EmptySummaryError("no text")
+
+    s._summarize_once = fake_once
+    with pytest.raises(sm.EmptySummaryError):
+        s.summarize("t")
+    # The model spent its whole token budget on reasoning; re-running
+    # temperature=0 would reproduce it, so never retry.
+    assert len(calls) == 1
+
+
+def test_stalled_generation_loop_never_retries(monkeypatch):
     monkeypatch.setattr(sm.time, "sleep", lambda _seconds: None)
     s = _make_summarizer()
     calls: list[str] = []
@@ -95,5 +112,53 @@ def test_progressed_stall_raises_without_retry(monkeypatch):
     s._summarize_once = fake_once
     with pytest.raises(StalledGenerationError):
         s.summarize("t")
-    # Output had started -> retrying the same trace would reproduce the loop.
+    # Post-hoc loop, always progressed=True -> never retried.
     assert len(calls) == 1
+
+
+# -- _summarize_once (blocking, post-hoc loop check) -----------------------
+
+
+def _summarizer_with_client(blocks, stop_reason="stop") -> sm.Summarizer:
+    """Summarizer with a fake client whose messages.create() returns blocks."""
+    s = object.__new__(sm.Summarizer)
+    s.cfg = SimpleNamespace(
+        gateway_model="qwen3.6-35b-a3b",
+        summary_max_tokens=8192,
+        repetition_window_chars=3,
+        repetition_min_repeats=3,
+    )
+    s._anthropic = SimpleNamespace(APITimeoutError=RuntimeError)
+
+    class _Messages:
+        def create(self, **kwargs):
+            return SimpleNamespace(content=blocks, stop_reason=stop_reason)
+
+    s._client = SimpleNamespace(messages=_Messages())
+    return s
+
+
+def test_summarize_once_returns_joined_text_blocks():
+    s = _summarizer_with_client([
+        SimpleNamespace(type="text", text="hello "),
+        SimpleNamespace(type="text", text="world"),
+    ])
+    assert s._summarize_once("t") == "hello world"
+
+
+def test_summarize_once_raises_empty_summary_when_no_text():
+    s = _summarizer_with_client([
+        SimpleNamespace(type="thinking", thinking="x" * 100),
+    ])
+    with pytest.raises(sm.EmptySummaryError):
+        s._summarize_once("t")
+
+
+def test_summarize_once_raises_loop_on_repeating_output():
+    # "abcabcabc" with window=3, min_repeats=3 => _is_looping True.
+    s = _summarizer_with_client([
+        SimpleNamespace(type="text", text="abcabcabc"),
+    ])
+    with pytest.raises(StalledGenerationError) as exc_info:
+        s._summarize_once("t")
+    assert exc_info.value.progressed is True

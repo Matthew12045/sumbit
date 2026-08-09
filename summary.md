@@ -1,5 +1,17 @@
 # Meeting Summarizer Redesign — richer output for a 128k-context gateway model
 
+> **Historical source spec (2026-08-10).** This document is the *original* design prompt that
+> produced the current bot; it is not read by any tooling (`build_bot_task.py` consumes
+> `meeting_bot_spec.md`). Since it was written, probing the real gateway
+> (`tools/probe_stream.py`) showed gateway.9arm.co **buffers the whole completion** (no
+> `thinking_delta` events during the silent thinking phase; the text arrives in a sub-second
+> burst at stream completion). The shipped summarizer is therefore **blocking**
+> (`client.messages.create()` with the `SUMMARIZE_TIMEOUT_SECONDS` ceiling), not streaming, with
+> the exact-repeat loop check run **post-hoc** on the completed thinking + text output
+> (`REPETITION_WINDOW_CHARS`/`REPETITION_MIN_REPEATS`). Streaming-specific details below
+> (`STALL_TIMEOUT_SECONDS`, a live stall/loop watchdog) are **superseded** — see
+> `meeting_bot_spec.md` and `meeting_bot/summarizer.py` for the authoritative design.
+
 ## Why the current design is thin
 
 Two independent caps are strangling this pipeline well below what the gateway can do:

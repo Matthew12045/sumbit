@@ -63,7 +63,7 @@ def main() -> int:
 
     print(
         f"prompt length: {len(prompt)} chars | model={cfg.gateway_model} | "
-        f"max_tokens={cfg.summary_max_tokens} | stall_timeout={cfg.stall_timeout_seconds}s"
+        f"max_tokens={cfg.summary_max_tokens}"
     )
     print("-" * 78)
 
@@ -103,12 +103,16 @@ def main() -> int:
         f"{total:.2f}s total | biggest single gap: {biggest_gap:.2f}s | "
         f"stop_reason={getattr(final, 'stop_reason', '?')}"
     )
-    if biggest_gap > cfg.stall_timeout_seconds:
-        print(
-            f"NOTE: biggest gap ({biggest_gap:.1f}s) exceeds STALL_TIMEOUT_SECONDS "
-            f"({cfg.stall_timeout_seconds}s) — this run would have raised "
-            f"StalledGenerationError in production even though it finished fine."
-        )
+    # Production no longer streams (blocking messages.create(), no stall guard
+    # -- see summarizer.py). This probe is pure characterization: did events
+    # trickle in throughout, or did the gateway buffer the whole completion
+    # and emit them in a burst near the end?
+    print(
+        "NOTE: streaming characterization only. If most events landed in a "
+        "burst near the end, the gateway buffers the whole completion. If "
+        "events trickled in with real gaps, the gateway does stream "
+        "incrementally."
+    )
     return 0
 
 

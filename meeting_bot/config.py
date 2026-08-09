@@ -36,7 +36,6 @@ _OPTIONAL_FLOAT_ENV = (
     ("SUMMARIZE_TIMEOUT_SECONDS", "summarize_timeout_seconds", 180.0),
     ("MAX_PROMPT_CHARS", "max_prompt_chars", 48000.0),
     ("SUMMARY_MAX_TOKENS", "summary_max_tokens", 8192.0),
-    ("STALL_TIMEOUT_SECONDS", "stall_timeout_seconds", 20.0),
     ("REPETITION_WINDOW_CHARS", "repetition_window_chars", 300.0),
     ("REPETITION_MIN_REPEATS", "repetition_min_repeats", 3.0),
 )
@@ -60,7 +59,6 @@ class Config:
     summarize_timeout_seconds: float = 180.0  # SDK client timeout for gateway
     max_prompt_chars: int = 48000      # transcript truncation limit (128k-context gateway)
     summary_max_tokens: int = 8192     # gateway output-token budget (qwen thinking + richer schema)
-    stall_timeout_seconds: float = 20.0  # per-event "no progress" guard in the stream loop
     repetition_window_chars: int = 300   # exact-repeat loop detection window
     repetition_min_repeats: int = 3      # identical consecutive windows before declaring a loop
 
@@ -111,7 +109,6 @@ def load_config(path: str | os.PathLike = ".env") -> Config:
         summarize_timeout_seconds=_optional_float("SUMMARIZE_TIMEOUT_SECONDS", 180.0),
         max_prompt_chars=int(_optional_float("MAX_PROMPT_CHARS", 48000.0)),
         summary_max_tokens=int(_optional_float("SUMMARY_MAX_TOKENS", 8192.0)),
-        stall_timeout_seconds=_optional_float("STALL_TIMEOUT_SECONDS", 20.0),
         repetition_window_chars=int(_optional_float("REPETITION_WINDOW_CHARS", 300.0)),
         repetition_min_repeats=int(_optional_float("REPETITION_MIN_REPEATS", 3.0)),
     )

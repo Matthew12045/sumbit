@@ -308,13 +308,13 @@ class MeetingBot(discord.Client):
                     # StalledGenerationError is a RuntimeError subclass and
                     # would otherwise be swallowed into the log-only branch.
                     log.exception(
-                        "summarizer stalled or looped — posting a "
-                        "failure note instead of an empty summary"
+                        "summarizer output detected as a repetition loop — "
+                        "posting a failure note instead of an empty summary"
                     )
                     note = (
-                        "⚠️ การสร้างสรุปการประชุมล้มเหลว: โมเดลหยุดนิ่งหรือสร้างข้อความซ้ำซ้อน "
-                        "(stream stall/loop) ลองเพิ่มค่า STALL_TIMEOUT_SECONDS / "
-                        "REPETITION_WINDOW_CHARS ในไฟล์ .env หรือตรวจสอบ Gateway"
+                        "⚠️ การสร้างสรุปการประชุมล้มเหลว: โมเดลสร้างข้อความซ้ำซ้อน "
+                        "(ตรวจพบ repetition loop) ลองเพิ่มค่า REPETITION_WINDOW_CHARS / "
+                        "REPETITION_MIN_REPEATS ในไฟล์ .env หรือตรวจสอบ Gateway"
                     )
                     try:
                         await target.send(note)
