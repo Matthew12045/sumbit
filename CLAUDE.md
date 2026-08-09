@@ -21,6 +21,16 @@ The active project: a real, long-running Discord bot that joins a voice channel,
 
 **Lazy import pattern (`meeting_bot/__init__.py`).** The package uses `__getattr__`/`__dir__` to defer importing `Config` (from `config`) and `MeetingBot` (from `bot`) until they are first accessed. This keeps `import meeting_bot` lightweight — the heavy deps (`discord`, `mlx-whisper`, `anthropic`) are never loaded until the bot actually runs. The pure modules (`config`, `audio`, `chunker`, `transcript`, `summary_parse`) are importable with only numpy present, so `pytest` runs in a minimal environment.
 
+**Diagnostic modules:** `meeting_bot/_pycord_diag.py` applies 7 monkeypatches for DAVE encryption (passthrough mode, UDP keep-alive EISCONN fix, etc.). `meeting_bot/wav_dump.py` writes each whisper input chunk as a 16 kHz mono WAV when `DUMP_CHUNKS_DIR` is set — used with `tools/offline_repro.py`, the A/B harness for testing decode strategies against real captured audio.
+
+**Summary parser (`summary_parse.py`).** The JSON→markdown→raw fallback parser is the key reliability mitigation for qwen's structured-output unreliability. Parse order: (1) JSON with Thai/English key tolerance and prose-stripping; (2) markdown header fallback (`หัวข้อ`/`Topics`, etc.); (3) last resort — raw text as a single-topic Summary. Never raises.
+
+**Voice trigger logic (`bot.py`).** In `on_voice_state_update`, count **humans only** (`[m for m in channel.members if not m.bot]`). Start meeting when humans are present and not connected. Finalize when target channel has no humans and bot is connected. When a human leaves but others remain, call `sink.flush_user(member.id)` to flush their trailing audio. Race guard: `_meeting_active` flag + lock; re-check humans before disconnect; member joining mid-finalize won't double-post.
+
+**Sink audio grace window:** After each `channel.connect()`, `bot.py` calls `sink.set_grace_until(monotonic + N)` to drop incoming PCM frames while DAVE derives per-sender decryption keys. Frames in this window would fail `NoValidCryptorFound` and corrupt the chunker. The grace timer is re-armed on mid-meeting reconnects too.
+
+**Poster (`poster.py`).** `build_embed()` constructs the Thai-language Discord embed (topics, decisions, action items with bullets, footer with duration/member count). `Poster.post()` retries up to 3× on 429/5xx rate limits.
+
 **Build contract (`meeting_bot_spec.md`).** This is the authoritative architecture doc and module contract that `build_bot_task.py` feeds to the jailed claude agent. Every class, function signature, import rule, and acceptance criterion is defined here. After `shepherd run select`, verify the 6 acceptance criteria from the spec: (1) `compileall` exits 0, (2) pure modules import with only numpy, (3) `--help`/`--doctor` work without connecting, (4) all documented signatures exist and `.env.example` matches `config.py`, (5) no secrets in any file, (6) `.env.example` keys match `config.py` exactly.
 
 **Commands:**
@@ -29,6 +39,14 @@ The active project: a real, long-running Discord bot that joins a voice channel,
 - `python3 -m meeting_bot --doctor` — config/import/gateway-probe readiness check, exits non-zero on failures.
 - `python3 -m meeting_bot` — run the bot (needs a populated `.env`).
 - `pytest -q` — pure-logic suites (no Discord/network).
+
+**Test suite** (`tests/`): 6 test files covering pure-logic modules only:
+- `test_audio.py` — resample output length, dtype float32, anti-alias correctness, tone mapping, silence detection
+- `test_chunker.py` — segment emission, min/max chunk enforcement, flush behavior
+- `test_transcript.py` — `[MM:SS]` formatting, chronological ordering, empty detection
+- `test_summary_parse.py` — JSON/markdown/garbage fallback paths, Thai/English keys
+- `test_transcriber.py` — garbage detection heuristics, retry logic, decode kwargs, env toggles
+- `test_wav_dump.py` — env-gated WAV writing, float32→int16 clamp, filename sanitization
 
 **Running the bot (verified on this machine, 2026-08):** Python 3.14.6 (homebrew), deps installed into user site-packages via `pip install -r requirements.txt` (py-cord resolves to `2.8.1.dev91+g326b72acc` — the pin works), `brew install opus` done (libopus at `/opt/homebrew/lib/libopus.dylib`). `numpy` is pinned `>=2.3.2` but pip settles it to **2.4.6** because `numba` (pulled in via mlx-whisper's chain) caps it at `<2.5` — the requirements comment documents this; don't force 2.5 back in. Before running live: copy `.env.example` → `.env`, fill `DISCORD_TOKEN`/`GUILD_ID`/`VOICE_CHANNEL_ID`/`TARGET_CHANNEL_ID`/`ANTHROPIC_AUTH_TOKEN`, and enable the **Server Members** privileged intent in the Developer Portal. First whisper run downloads ~3 GB (whisper-large-v3-mlx) into `~/.cache/huggingface`.
 

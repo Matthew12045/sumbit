@@ -8,6 +8,8 @@ __pycache__/
 
 # Bot secrets — never commit the real .env
 .env
+# Pre-deepseek switch backup of .env (contains the gateway.9arm.co token)
+.env.qwen-backup
 
 # Debug log output
 meeting_bot_debug.log
