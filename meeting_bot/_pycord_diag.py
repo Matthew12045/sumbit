@@ -3,15 +3,26 @@
 Imported once at startup by ``bot.py`` — the patches activate at module
 import time.
 
-Patches 1-6: diagnostics (logging only).
-Patches 7-8: FIX — enable DAVE passthrough mode during protocol transitions
-so unencrypted packets from Discord's transition window pass through instead
-of being dropped, which would otherwise cause MLS ratchet drift.
+Patches 1-7: diagnostics + fixes.
+The DAVE passthrough fix is applied in THREE places (patches 3, 4, 5):
+  - Patch 4 (reinit_dave_session): enables passthrough on NEW session,
+    BEFORE the MLS handshake completes.  This is the primary fix — it
+    prevents the ratchet from drifting when dave.ready first flips True.
+  - Patch 5 (execute_dave_transition): re-enables passthrough after
+    every protocol transition (covers the 1→1 refresh case).
+  - Patch 3 (decrypt_rtp): reactive fallback — enables passthrough on
+    first DAVE decrypt failure (catches edge cases like epoch changes).
+
+Patch 7 (UDPKeepAlive.run): fixes the macOS EISCONN busy-loop — the UDP
+socket is already connect()ed by VoiceWebSocket.ready(), so send() is used
+instead of sendto() with an explicit destination, with a bounded backoff on
+the failure path.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -239,7 +250,7 @@ _orig_reinit_dave = None
 
 
 async def _patched_reinit_dave(self) -> None:
-    global _orig_reinit_dave
+    global _orig_reinit_dave, _dave_fail_count, _dave_success_count
 
     proto = getattr(self, "dave_protocol_version", "?")
     old_session = getattr(self, "dave_session", None)
@@ -256,7 +267,34 @@ async def _patched_reinit_dave(self) -> None:
         getattr(self, "channel_id", "?"),
     )
 
-    return await _orig_reinit_dave(self)
+    await _orig_reinit_dave(self)
+
+    # FIX: Enable passthrough on the NEW session immediately after creation.
+    # Without this, the DAVE session's `ready` flag flips to True mid-stream
+    # (MLS handshake completes) BEFORE Discord sends the DAVE transition op 22.
+    # dave.decrypt() starts being called on transport-only-encrypted packets,
+    # raises ValueError (UnencryptedWhenPassthroughDisabled), the MLS ratchet
+    # drifts, and EVERY subsequent packet fails — even after the transition.
+    new_session = getattr(self, "dave_session", None)
+    new_proto = getattr(self, "dave_protocol_version", 0)
+    if new_session is not None and new_proto and int(new_proto) > 0:
+        try:
+            new_session.set_passthrough_mode(True, _PASSTHROUGH_GRACE_SECONDS)
+            log.info(
+                "FIX: enabled DAVE passthrough for %.0fs on new session "
+                "(proto=%s)",
+                _PASSTHROUGH_GRACE_SECONDS,
+                new_proto,
+            )
+        except Exception:
+            log.debug(
+                "FIX: set_passthrough_mode failed in reinit (non-critical)",
+                exc_info=True,
+            )
+
+    # Reset failure/success counters so fresh diagnostics start each session.
+    _dave_fail_count = 0
+    _dave_success_count = 0
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +390,54 @@ def _patched_audioreader_init(self, sink, client, *, after=None, args=None, star
 
 
 # ---------------------------------------------------------------------------
+# Patch 7: UDPKeepAlive.run — fix EISCONN busy-loop on macOS
+# ---------------------------------------------------------------------------
+
+_orig_udp_keep_alive_run = None
+_KEEPALIVE_RETRY_WAIT_SECONDS = 1.0
+
+
+def _patched_udp_keep_alive_run(self) -> None:
+    global _orig_udp_keep_alive_run
+
+    self.client.wait_until_connected()
+
+    while not self._end_thread.is_set():
+        vc = self.client
+
+        try:
+            packet = self.counter.to_bytes(8, "big")
+        except OverflowError:
+            self.counter = 0
+            continue
+
+        try:
+            # The UDP socket was already connect()ed by VoiceWebSocket.ready()
+            # (loop.sock_connect), so send() is correct — sendto() with an
+            # explicit destination raises EISCONN (OSError 56) on macOS.
+            vc._connection.socket.send(packet)
+        except Exception as exc:
+            log.debug(
+                "Error while sending udp keep alive to socket %s at %s:%s",
+                vc._connection.socket,
+                vc._connection.endpoint_ip,
+                vc._connection.voice_port,
+                exc_info=exc,
+            )
+            vc.wait_until_connected()
+            if vc.is_connected():
+                # Bounded backoff so a persistent failure can't busy-loop /
+                # log-flood the way the original sendto() path did. Event.wait
+                # also stays responsive to stop().
+                self._end_thread.wait(_KEEPALIVE_RETRY_WAIT_SECONDS)
+                continue
+            break
+        else:
+            self.counter += 1
+            time.sleep(self.delay)
+
+
+# ---------------------------------------------------------------------------
 # Apply patches at import time
 # ---------------------------------------------------------------------------
 
@@ -359,7 +445,7 @@ def _patched_audioreader_init(self, sink, client, *, after=None, args=None, star
 def _apply():
     global _orig_load_secret_key, _orig_aead_decrypt
     global _orig_decrypt_rtp, _orig_reinit_dave, _orig_execute_dave
-    global _orig_audioreader_init
+    global _orig_audioreader_init, _orig_udp_keep_alive_run
 
     import discord.voice.gateway
     import discord.voice.receive.reader
@@ -394,7 +480,11 @@ def _apply():
     _orig_audioreader_init = discord.voice.receive.reader.AudioReader.__init__
     discord.voice.receive.reader.AudioReader.__init__ = _patched_audioreader_init
 
-    log.info("DIAG: py-cord monkeypatches applied (6 patches)")
+    # Patch 7: UDP keep-alive send() fix (EISCONN on macOS)
+    _orig_udp_keep_alive_run = discord.voice.receive.reader.UDPKeepAlive.run
+    discord.voice.receive.reader.UDPKeepAlive.run = _patched_udp_keep_alive_run
+
+    log.info("DIAG: py-cord monkeypatches applied (7 patches)")
 
 
 _apply()
