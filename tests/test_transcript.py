@@ -76,7 +76,7 @@ def test_to_prompt_text_none_disables_truncation():
 
 
 def test_to_prompt_text_default_max_chars():
-    """Default max_chars=6000 applies when called with no arguments."""
+    """Default max_chars=48000 applies when called with no arguments."""
     transcript = Transcript(started_at=0.0)
     transcript.add(TranscriptEvent(speaker="A", start=0.0, text="short"))
     text = transcript.to_prompt_text()

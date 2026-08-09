@@ -13,7 +13,7 @@ from .chunker import SilenceChunker
 from .config import Config
 from .poster import Poster
 from .sink import MeetingSink
-from .summarizer import EmptySummaryError, Summarizer
+from .summarizer import EmptySummaryError, StalledGenerationError, Summarizer
 from .summary_parse import parse_summary
 from .transcriber import Transcriber
 from .transcript import Transcript
@@ -303,6 +303,23 @@ class MeetingBot(discord.Client):
                         await target.send(note)
                     except Exception:  # noqa: BLE001
                         log.exception("failed to post empty-summary failure note")
+                except StalledGenerationError:
+                    # Must sit BEFORE the generic `except Exception` below:
+                    # StalledGenerationError is a RuntimeError subclass and
+                    # would otherwise be swallowed into the log-only branch.
+                    log.exception(
+                        "summarizer stalled or looped — posting a "
+                        "failure note instead of an empty summary"
+                    )
+                    note = (
+                        "⚠️ การสร้างสรุปการประชุมล้มเหลว: โมเดลหยุดนิ่งหรือสร้างข้อความซ้ำซ้อน "
+                        "(stream stall/loop) ลองเพิ่มค่า STALL_TIMEOUT_SECONDS / "
+                        "REPETITION_WINDOW_CHARS ในไฟล์ .env หรือตรวจสอบ Gateway"
+                    )
+                    try:
+                        await target.send(note)
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to post stall/loop failure note")
                 except Exception as exc:  # noqa: BLE001
                     exc_name = type(exc).__name__
                     if "Timeout" in exc_name or "timeout" in exc_name.lower():

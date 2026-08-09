@@ -27,7 +27,7 @@ class Transcript:
     def events(self) -> list[TranscriptEvent]:
         return list(self._events)
 
-    def to_prompt_text(self, max_chars: int | None = 6000) -> str:
+    def to_prompt_text(self, max_chars: int | None = 48000) -> str:
         """Render chronologically as ``[MM:SS] ผู้พูด: ...`` lines.
 
         If ``max_chars`` is not None and the rendered text exceeds it, the text

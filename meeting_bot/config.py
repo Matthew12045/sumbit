@@ -33,9 +33,12 @@ _OPTIONAL_FLOAT_ENV = (
     ("SILENCE_SECONDS", "silence_seconds", 0.8),
     ("MIN_CHUNK_SECONDS", "min_chunk_seconds", 1.0),
     ("MAX_CHUNK_SECONDS", "max_chunk_seconds", 30.0),
-    ("SUMMARIZE_TIMEOUT_SECONDS", "summarize_timeout_seconds", 90.0),
-    ("MAX_PROMPT_CHARS", "max_prompt_chars", 6000.0),
-    ("SUMMARY_MAX_TOKENS", "summary_max_tokens", 4096.0),
+    ("SUMMARIZE_TIMEOUT_SECONDS", "summarize_timeout_seconds", 180.0),
+    ("MAX_PROMPT_CHARS", "max_prompt_chars", 48000.0),
+    ("SUMMARY_MAX_TOKENS", "summary_max_tokens", 8192.0),
+    ("STALL_TIMEOUT_SECONDS", "stall_timeout_seconds", 20.0),
+    ("REPETITION_WINDOW_CHARS", "repetition_window_chars", 300.0),
+    ("REPETITION_MIN_REPEATS", "repetition_min_repeats", 3.0),
 )
 
 
@@ -54,9 +57,12 @@ class Config:
     silence_seconds: float = 0.8        # trailing silence to close a chunk
     min_chunk_seconds: float = 1.0      # shorter closed chunks are dropped
     max_chunk_seconds: float = 30.0     # force-close cap
-    summarize_timeout_seconds: float = 90.0  # SDK client timeout for gateway
-    max_prompt_chars: int = 6000        # transcript truncation limit
-    summary_max_tokens: int = 4096      # gateway output-token budget (qwen thinking)
+    summarize_timeout_seconds: float = 180.0  # SDK client timeout for gateway
+    max_prompt_chars: int = 48000      # transcript truncation limit (128k-context gateway)
+    summary_max_tokens: int = 8192     # gateway output-token budget (qwen thinking + richer schema)
+    stall_timeout_seconds: float = 20.0  # per-event "no progress" guard in the stream loop
+    repetition_window_chars: int = 300   # exact-repeat loop detection window
+    repetition_min_repeats: int = 3      # identical consecutive windows before declaring a loop
 
 
 def load_config(path: str | os.PathLike = ".env") -> Config:
@@ -102,9 +108,12 @@ def load_config(path: str | os.PathLike = ".env") -> Config:
         silence_seconds=_optional_float("SILENCE_SECONDS", 0.8),
         min_chunk_seconds=_optional_float("MIN_CHUNK_SECONDS", 1.0),
         max_chunk_seconds=_optional_float("MAX_CHUNK_SECONDS", 30.0),
-        summarize_timeout_seconds=_optional_float("SUMMARIZE_TIMEOUT_SECONDS", 90.0),
-        max_prompt_chars=int(_optional_float("MAX_PROMPT_CHARS", 6000.0)),
-        summary_max_tokens=int(_optional_float("SUMMARY_MAX_TOKENS", 4096.0)),
+        summarize_timeout_seconds=_optional_float("SUMMARIZE_TIMEOUT_SECONDS", 180.0),
+        max_prompt_chars=int(_optional_float("MAX_PROMPT_CHARS", 48000.0)),
+        summary_max_tokens=int(_optional_float("SUMMARY_MAX_TOKENS", 8192.0)),
+        stall_timeout_seconds=_optional_float("STALL_TIMEOUT_SECONDS", 20.0),
+        repetition_window_chars=int(_optional_float("REPETITION_WINDOW_CHARS", 300.0)),
+        repetition_min_repeats=int(_optional_float("REPETITION_MIN_REPEATS", 3.0)),
     )
 
 

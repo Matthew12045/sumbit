@@ -4,7 +4,7 @@ You are implementing a complete, runnable Discord bot package from this spec. Re
 
 ## Overview
 
-A Discord bot that joins a voice channel, transcribes the meeting live in **Thai**, and when the **last human** leaves the voice channel, automatically posts a structured summary — **Topics / Decisions / Action Items** — to a configured text channel. No manual command triggers it.
+A Discord bot that joins a voice channel, transcribes the meeting live in **Thai**, and when the **last human** leaves the voice channel, automatically posts a structured summary — **overview / Topics / Decisions / Action Items / open questions** — to a configured text channel. No manual command triggers it.
 
 Data flow:
 
@@ -15,8 +15,8 @@ Discord voice channel
   → silence-based chunking per speaker (worker thread safety)
   → mlx-whisper (local, Metal) transcribes each closed chunk in Thai
   → accumulate labeled transcript
-  → on voice channel empty: local gateway (Anthropic-compatible) summarizes
-  → post structured embed to target text channel
+  → on voice channel empty: STREAMING local gateway (Anthropic-compatible) summarizes
+  → post compact embed + full Markdown file attachment to target text channel
 ```
 
 ## Locked decisions (do not change)
@@ -25,7 +25,7 @@ Discord voice channel
 
    **macOS prerequisite:** `brew install opus` is required for voice (py-cord ships libopus only as Windows DLLs). The bot's `doctor()` checks `ctypes.util.find_library("opus")`. First whisper run downloads ~3 GB into `~/.cache/huggingface` (host default is fine; set `HF_HOME` only if the cache must live elsewhere).
 2. **STT:** local `mlx-whisper`, model `mlx-community/whisper-large-v3-mlx` (non-turbo — large-v3-turbo is prone to confident repetition-loop hallucinations on Thai), `language="th"`. No cloud API. Runs on the same Apple Silicon MacBook as the AI gateway, so GPU contention is a real concern — serialized worker, fp16, model cached once. The transcriber hardens the decode (`condition_on_previous_text=False`, greedy T=0) and re-decodes once with a small temperature bump + Thai preamble when a decode is flagged garbage; see `tools/offline_repro.py` for an A/B harness.
-3. **Summarization:** the user's own gateway via the **Anthropic-compatible** API — `anthropic` SDK, `base_url=https://gateway.9arm.co`, `auth_token` from env (`ANTHROPIC_AUTH_TOKEN`), model `qwen3.6-35b-a3b`. **Do not put `/v1` in the base URL** (the SDK appends `/v1/messages`). qwen's structured-output reliability is the known risk — the summary parse must never raise.
+3. **Summarization:** the user's own gateway via the **Anthropic-compatible** API — `anthropic` SDK, `base_url=https://gateway.9arm.co`, `auth_token` from env (`ANTHROPIC_AUTH_TOKEN`), model `qwen3.6-35b-a3b`. **Do not put `/v1` in the base URL** (the SDK appends `/v1/messages`). The call **streams** via `client.messages.stream()` (SSE) so the summary can exploit the gateway's **128k context** — prompt budget `MAX_PROMPT_CHARS=48000`, output budget `SUMMARY_MAX_TOKENS=8192`, SDK client timeout `SUMMARIZE_TIMEOUT_SECONDS=180`. qwen's structured-output reliability is the known risk — the summary parse must never raise. The stream loop carries its own stall/loop guards (see `summarizer.py`): a per-event no-progress timeout `STALL_TIMEOUT_SECONDS`, and exact-repeat detection `REPETITION_WINDOW_CHARS` × `REPETITION_MIN_REPEATS`. A stalled/looping generation raises `StalledGenerationError` (retried **once** only when zero bytes had streamed), which `bot.py` surfaces as a visible ⚠️ note in the target channel.
 4. **Secrets/config:** `.env` (never committed) via python-dotenv. A `.env.example` mirrors every key with placeholders and comments, no real secrets.
 
 ## File tree — produce exactly this
@@ -39,22 +39,26 @@ meeting_bot/
   sink.py              # MeetingSink(discord.sinks.Sink) per-user PCM capture
   transcriber.py       # Transcriber: background mlx-whisper worker
   transcript.py        # TranscriptEvent, Transcript accumulator (stdlib only)
-  summary_parse.py     # Summary, ActionItem, parse_summary() (stdlib only)
-  summarizer.py        # Summarizer: anthropic gateway call (lazy anthropic import)
-  poster.py            # build_embed(), Poster
+  summary_parse.py     # Summary, TopicItem, DecisionItem, ActionItem, parse_summary() (stdlib only)
+  summarizer.py        # Summarizer: STREAMING anthropic gateway call (lazy anthropic import)
+  poster.py            # build_embed(), render_markdown(), Poster
   bot.py               # MeetingBot(discord.Client): voice trigger + orchestration
   main.py              # argparse entrypoint: run | --doctor
   __main__.py          # raise SystemExit(main())
+  wav_dump.py          # env-gated DUMP_CHUNKS_DIR .wav writer (stdlib only)
 tests/
   test_audio.py
   test_chunker.py
   test_transcript.py
   test_summary_parse.py
+  test_transcriber.py
+  test_wav_dump.py
+  test_summarizer.py
 requirements.txt
 .env.example
 ```
 
-**Import rule (load-bearing).** `config.py`, `audio.py`, `chunker.py`, `transcript.py`, `summary_parse.py`, `wav_dump.py` must import **only stdlib + numpy** at module scope (`wav_dump.py` is stdlib-only). `summarizer.py` imports `anthropic` lazily (inside `__init__`/methods, not at module scope). `sink.py`, `bot.py`, `poster.py` may import `discord`. `config.py` imports `dotenv`/`load_dotenv` **inside `load_config()` only** — python-dotenv is neither stdlib nor numpy, so a module-scope import breaks the pure-import rule. This lets the pure modules be imported and tested without the heavy deps installed.
+**Import rule (load-bearing).** `config.py`, `audio.py`, `chunker.py`, `transcript.py`, `summary_parse.py`, `summarizer.py`, `wav_dump.py` must import **only stdlib + numpy** at module scope (`wav_dump.py` is stdlib-only; `summarizer.py` imports only `logging`, `queue`, `threading`, `time`, and `.config` at module scope). `summarizer.py` imports `anthropic` **lazily** (inside `__init__`/methods, not at module scope). `sink.py`, `bot.py`, `poster.py` may import `discord`. `config.py` imports `dotenv`/`load_dotenv` **inside `load_config()` only** — python-dotenv is neither stdlib nor numpy, so a module-scope import breaks the pure-import rule. This lets the pure modules be imported and tested without the heavy deps installed.
 
 ## Module contracts
 
@@ -66,15 +70,21 @@ class Config:
     guild_id: int
     voice_channel_id: int
     target_channel_id: int
-    anthropic_base_url: str      # no trailing /v1
+    anthropic_base_url: str      # no trailing /v1 (the SDK appends /v1/messages)
     anthropic_auth_token: str
     gateway_model: str           # qwen3.6-35b-a3b
     whisper_model: str           # mlx-community/whisper-large-v3-mlx
     whisper_language: str        # "th"
-    silence_threshold: float = 0.01     # RMS speech threshold (−40 dBFS)
+    silence_threshold: float = 0.01     # RMS speech threshold (~ −40 dBFS)
     silence_seconds: float = 0.8        # trailing silence to close a chunk
     min_chunk_seconds: float = 1.0      # shorter closed chunks are dropped
     max_chunk_seconds: float = 30.0     # force-close cap
+    summarize_timeout_seconds: float = 180.0  # SDK client timeout for gateway
+    max_prompt_chars: int = 48000      # transcript truncation limit (128k-context gateway)
+    summary_max_tokens: int = 8192     # gateway output-token budget (qwen thinking + richer schema)
+    stall_timeout_seconds: float = 20.0  # per-event "no progress" guard in the stream loop
+    repetition_window_chars: int = 300   # exact-repeat loop detection window
+    repetition_min_repeats: int = 3      # identical consecutive windows before declaring a loop
 
 def load_config(path: str | os.PathLike = ".env") -> Config: ...
 def doctor(cfg: Config) -> list[str]:   # list of "ok: ..."/"fail: ..." lines
@@ -150,70 +160,98 @@ class Transcript:
     def __init__(self, started_at: float): ...
     def add(self, event: TranscriptEvent) -> None: ...
     def events(self) -> list[TranscriptEvent]: ...
-    def to_prompt_text(self) -> str: ...   # "[MM:SS] ผู้พูด: ..." per line, chronological
+    def to_prompt_text(self, max_chars: int | None = 48000) -> str: ...
+    # "[MM:SS] ผู้พูด: ..." per line, chronological.  Truncates to max_chars
+    # (whole lines only, with a "...(truncated)" suffix); None disables.
     def is_empty(self) -> bool: ...
 ```
 
 ### `summary_parse.py` (pure stdlib — the reliability mitigation)
 ```python
 @dataclass
+class TopicItem:
+    title: str
+    detail: str = ""
+
+@dataclass
+class DecisionItem:
+    decision: str
+    rationale: str = ""
+
+@dataclass
 class ActionItem:
     action: str
     owner: str | None = None
+    due: str | None = None
     @classmethod
     def parse(cls, obj) -> "ActionItem": ...   # dict or plain string
 
 @dataclass
 class Summary:
-    topics: list[str]
-    decisions: list[str]
+    overview: str
+    topics: list[TopicItem]
+    decisions: list[DecisionItem]
     action_items: list[ActionItem]
+    open_questions: list[str]
     raw: str
 
 def parse_summary(text: str) -> Summary: ...   # never raises
 ```
-Parse order:
-1. **JSON attempt:** strip ```json``` fences and prose before `{`/after `}`; `json.loads`; tolerate Thai or English keys (`topics`/`หัวข้อ`, `decisions`/`การตัดสินใจ`, `action_items`/`รายการที่ต้องทำ`); coerce each action item via `ActionItem.parse` (dict or plain string).
-2. **Markdown fallback:** split on section headers matching `หัวข้อ|Topics`, `การตัดสินใจ|Decisions`, `สิ่งที่ต้องทำ|Action Items`; collect `-`/`*` bullets.
-3. **Last resort:** `Summary(topics=[raw.strip()], ...)`. Never raise.
+`__all__ = ["ActionItem", "TopicItem", "DecisionItem", "Summary", "parse_summary"]`.
 
-### `summarizer.py` (anthropic, lazy import)
+Parse order:
+1. **JSON attempt:** strip ```json``` fences and prose before `{`/after `}`; `json.loads`; tolerate Thai or English keys: `overview`/`ภาพรวม`/`สรุปภาพรวม`, `topics`/`หัวข้อ`, `decisions`/`การตัดสินใจ`, `action_items`/`รายการที่ต้องทำ`, `open_questions`/`คำถามที่ยังไม่ได้ข้อสรุป`/`ประเด็นค้าง`. Item-level keys too: topic `title`/`หัวข้อ` + `detail`/`รายละเอียด`; decision `decision`/`การตัดสินใจ` + `rationale`/`เหตุผล`; action `action` + `owner` + `due`/`กำหนดเวลา`/`ครบกำหนด`. Coerce items via `TopicItem`/`DecisionItem`/`ActionItem` — **plain-string list items wrap into `TopicItem(title=s, detail="")` / `DecisionItem(decision=s, rationale="")` (backward-compat with the old schema)**; `ActionItem.parse` accepts a dict or a plain string.
+2. **Markdown fallback:** split on section headers matching `หัวข้อ|Topics`, `การตัดสินใจ|Decisions`, `สิ่งที่ต้องทำ|Action Items`, plus `ภาพรวม|Overview` and `คำถามที่ยังไม่ได้ข้อสรุป|Open Questions`; collect `-`/`*` bullets. Overview is collected as a **paragraph** (non-bullet lines until the next header); open questions as bullets. Topic/decision bullets split on `label: value`, `—`, or `–` into title/detail and decision/rationale (a bare bullet with no separator is the title with empty detail; strip `**` from a bold title). Return the result if **any** of overview/topics/decisions/action_items/open_questions was found.
+3. **Last resort:** `Summary(overview=text, topics=[], decisions=[], action_items=[], open_questions=[], raw=text)`. Empty input → `overview=""`. Never raise.
+
+### `summarizer.py` (anthropic, lazy import — STREAMING)
 ```python
+class EmptySummaryError(RuntimeError): ...
+class StalledGenerationError(RuntimeError):
+    def __init__(self, message: str, *, progressed: bool) -> None: ...
+    # progressed = whether ANY output bytes had streamed before the stall/loop
+
 class Summarizer:
-    def __init__(self, cfg: Config): ...
-    def summarize(self, transcript_text: str) -> str: ...   # blocking SDK call
+    def __init__(self, cfg: Config): ...    # max_retries=0; anthropic imported here (lazy)
+    def summarize(self, transcript_text: str) -> str: ...   # blocking; never returns non-text
+    def _summarize_once(self, transcript_text: str) -> str: ...  # one streaming attempt
 ```
-```python
-client = anthropic.Anthropic(
-    base_url=cfg.anthropic_base_url,     # e.g. https://gateway.9arm.co  (no /v1)
-    auth_token=cfg.anthropic_auth_token, # -> Authorization: Bearer ...
-    timeout=120.0,
-)
-resp = client.messages.create(
-    model=cfg.gateway_model,             # qwen3.6-35b-a3b
-    max_tokens=2000,
-    temperature=0.0,
-    system=<Thai JSON-contract system prompt>,
-    messages=[{"role": "user", "content": transcript_text}],
-)
-text = "".join(b.text for b in resp.content if b.type == "text")
-```
-System prompt (Thai): instruct the model to reply only in Thai and output only the JSON schema below, no markdown fence, no other text. The user message additionally instructs empty sections must be `[]`.
+`__all__ = ["Summarizer", "EmptySummaryError", "StalledGenerationError"]`. Module scope imports are **only** `logging`, `queue`, `threading`, `time`, and `from .config import Config` — `anthropic` is imported lazily inside `__init__`.
+
+**Streaming mechanics (`_summarize_once`).** Use `client.messages.stream(...)` (SSE) instead of a blocking `messages.create`, so output can be inspected *as it arrives* for stalls/loops. A daemon **pump thread** iterates the stream context and pushes each event (`delta.text` or `delta.thinking`) onto a `queue.Queue`; the calling thread drains the queue with `q.get(timeout=cfg.stall_timeout_seconds)`. On `queue.Empty` raise `StalledGenerationError(..., progressed=bool(buf))`; on `_DONE`, call `stream.get_final_message()` and join the emitted `text` blocks. If no text at all, raise `EmptySummaryError` (qwen sometimes spends the entire token budget in its thinking trace and never emits a text block — the rich schema + `SUMMARY_MAX_TOKENS` budget is the mitigation, but the bot must still never post an empty summary). A silent-stall pump thread can linger until the 180 s SDK timeout; it is a daemon thread and the `with` block closes the SSE connection on unwind — this is accepted.
+
+**Stall/loop guard.** `_is_looping(buf, window, min_repeats)` returns True when the last `min_repeats` consecutive trailing `window`-char slices are byte-identical (qwen's thinking trace can loop without terminating); the caller aborts and raises `StalledGenerationError(progressed=True)`. Guard clauses return False for `window <= 0`, `min_repeats < 2`, or `len(buf) < window * min_repeats`. The exact-repeat check must not false-positive on legitimate repetitive JSON schema output (repeated `"owner":` keys, etc.).
+
+**Retry policy.** `summarize()` retries **once, and only when `exc.progressed` is False** (a zero-progress stall — nothing was emitted, so a fresh attempt costs nothing). A loop or stall after output started is **never** retried: `temperature=0` means re-running reproduces the same trace. `max_retries=0` disables the SDK's own retry loop (the manual policy above is authoritative).
+
+**Contract & schema.** `timeout=cfg.summarize_timeout_seconds` on the client; `max_tokens=cfg.summary_max_tokens`, `temperature=0.0`. The Thai system prompt instructs the model to reply only in Thai and output **only** the JSON below (no markdown fence, no other text); the user message appends a suffix demanding empty sections be `[]`/`""`/`null` per type:
 
 ```json
-{ "topics": ["..."], "decisions": ["..."], "action_items": [{"action": "...", "owner": "..."}] }
+{
+  "overview": "...",
+  "topics": [{"title": "...", "detail": "..."}],
+  "decisions": [{"decision": "...", "rationale": "..."}],
+  "action_items": [{"action": "...", "owner": "...", "due": "..."}],
+  "open_questions": ["..."]
+}
 ```
-The bot drains the summary text through `summary_parse.parse_summary`. Call `summarize` via `asyncio.to_thread` from `bot.py` so the event loop isn't blocked.
+The bot drains the returned text through `summary_parse.parse_summary`. Call `summarize` via `asyncio.to_thread` from `bot.py` so the event loop isn't blocked.
 
 ### `poster.py`
 ```python
 def build_embed(summary, *, started_at: datetime, duration: timedelta,
                 member_count: int, meeting_title: str | None = None) -> discord.Embed: ...
+def render_markdown(summary, *, started_at: datetime, duration: timedelta,
+                    member_count: int, meeting_title: str | None = None) -> str: ...
 class Poster:
     def __init__(self, config): ...
     async def post(self, channel, summary, *, meta) -> discord.Message: ...
 ```
-Embed titled `📝 สรุปการประชุม`, one field per section (`หัวข้อที่พูดคุย`, `การตัดสินใจ`, `รายการที่ต้องทำ`, `•` bullets), footer with guild/voice-channel name, date, duration, member count. `meeting_title` is optional — when `None`, default to the guild/voice-channel name. Send to `target_channel_id` via `bot.get_channel(...)`. Retry up to 3× on 429/5xx.
+**Two-output design: a compact embed as a scannable index + the full detail as an attached `summary.md` file** (the embed is capped by Discord's 6000-char/embed limit; the file is where "more context" actually lives, untruncated).
+
+- `build_embed` — titled `📝 สรุปการประชุม`; `description = summary.overview or meeting_title or "การประชุม"` truncated to fit the embed budget (`_TRUNCATE_NOTE = "…ดูรายละเอียดเพิ่มเติมในไฟล์แนบ"` appended within the limit). One field per section: `หัวข้อที่พูดคุย` (`• **{title}** — {detail}`; bare `• **{title}**` when detail empty), `การตัดสินใจ` (same pattern with `decision`/`rationale`), `รายการที่ต้องทำ` (`• {action} — {owner}` + ` (due: …)` when present), `คำถามที่ยังไม่ได้ข้อสรุป` (`—` when empty). Every field truncated to 1024 chars (the note re-appended when truncating). Footer with guild/voice-channel name, date, duration, member count. `meeting_title` is optional — when `None`, default to the guild/voice-channel name.
+- `render_markdown` — the full untruncated document: title + overview, `### {title}` per topic + full `detail`, `### {decision}` per decision + full `rationale`, an action-item table (`# | สิ่งที่ต้องทำ | ผู้รับผิดชอบ | กำหนดส่ง`), all open questions.
+- `Poster.post` — render the markdown once; build `discord.File(io.BytesIO(md.encode("utf-8")), filename="summary.md")` **inside the retry loop** (a failed send consumes the BytesIO, so re-create it per attempt); `channel.send(embed=embed, file=file)`. Send to `target_channel_id` via `bot.get_channel(...)`. Retry up to 3× on 429/5xx. ASCII filename.
 
 ### `bot.py`
 ```python
@@ -230,7 +268,7 @@ class MeetingBot(discord.Client):
   - Humans present in the target voice channel and not connected → `_start_meeting`.
   - Target channel now has no humans and we're connected → `_finalize`.
   - A human left the target channel but humans remain and the meeting is active → `sink.flush_user(member.id)` (flush that speaker's trailing audio into the transcript).
-- **Finalize:** stop recording, then `transcriber.stop(flush=True)` (drains the input queue so the flushed trailing chunk is transcribed) and `drain(timeout)` for pending events, then build the transcript. If `transcript.is_empty()`, post a "no speech detected" note instead of calling the summarizer. Otherwise summarize (via `asyncio.to_thread`), parse, post the embed to the target channel, then disconnect. Do **not** rely on `stop_recording`'s `once_done` callback firing (the pinned branch has a known truthiness bug with empty args) — drive finalize from `on_voice_state_update` directly.
+- **Finalize:** stop recording, then `transcriber.stop(flush=True)` (drains the input queue so the flushed trailing chunk is transcribed) and `drain(timeout)` for pending events, then build the transcript. If `transcript.is_empty()`, post a "no speech detected" note instead of calling the summarizer. Otherwise summarize (via `asyncio.to_thread`), parse, post the embed + file to the target channel, then disconnect. Handle summarizer failures visibly rather than silently: `except EmptySummaryError` posts a Thai "no summary generated" note; `except StalledGenerationError` (a `RuntimeError` subclass, so catch it **before** the generic `except Exception`) posts a ⚠️ note explaining the stream stalled/looped and pointing at `STALL_TIMEOUT_SECONDS` / `REPETITION_WINDOW_CHARS`. Do **not** rely on `stop_recording`'s `once_done` callback firing (the pinned branch has a known truthiness bug with empty args) — drive finalize from `on_voice_state_update` directly.
 - **Race guard:** `_meeting_active` flag + lock; re-check humans before disconnecting; a member joining mid-finalize must not double-post.
 - **Watchdog:** if no PCM frames arrive N seconds (e.g. 10 s) after `start_recording`, log a prominent warning referencing py-cord issue #3139 and the required py-cord pin.
 
@@ -245,10 +283,11 @@ def main(argv: list[str] | None = None) -> int:
 ### `tests/` (pytest, pure logic only — no Discord/network)
 - `test_audio.py`: resample output length `⌊n*960/3⌋`-derived; dtype float32; range ⊆ [−1,1]; a 1 kHz tone at 48 kHz maps to correct 16 kHz samples; silence → ~0 energy; `is_speech_block` threshold behavior.
 - `test_chunker.py`: [silence, 2 s tone, silence] → exactly one Segment with correct speaker/timestamps; sub-`min_chunk_seconds` blip dropped; continuous > `max_chunk_seconds` forced into multiple segments; `flush()` closes trailing partial.
-- `test_transcript.py`: `to_prompt_text()` ordering + `[MM:SS]` format; `is_empty()`.
-- `test_summary_parse.py`: valid JSON → Summary; fenced JSON → parses; markdown sections → fallback; English-key JSON → parses; garbage → non-raising last resort.
+- `test_transcript.py`: `to_prompt_text()` ordering + `[MM:SS]` format; default `max_chars=48000`; explicit truncation (≤ limit, `...(truncated)` suffix, whole lines) and `max_chars=None` disables; `is_empty()`.
+- `test_summary_parse.py`: new-schema JSON (overview + `TopicItem`/`DecisionItem`/`ActionItem` with due) → Summary; fenced JSON + prose → parses; Thai keys (`ภาพรวม`, `หัวข้อ`, `การตัดสินใจ`, `รายการที่ต้องทำ` with `กำหนดเวลา`, `คำถามที่ยังไม่ได้ข้อสรุป`) and English keys → parse; **backward-compat**: old bare-string topics/decisions wrap into `TopicItem`/`DecisionItem` with empty detail/rationale; markdown fallback with `ภาพรวม`/`คำถามที่ยังไม่ได้ข้อสรุป` headers and `label: value`/`—` splits; garbage → non-raising last resort (`overview == raw`); empty → all empty; `ActionItem.parse` plain string and dict-with-due.
 - `test_transcriber.py`: `is_garbage_transcription` heuristics (long char runs, token-ratio, Thai no-whitespace repetition); Thai politeness particles (`ครับ ครับ ครับ`, `ค่ะ ค่ะ`) never flagged; `should_retry` (garbage → retry, high `no_speech_prob` → retry, empty/whitespace → never, threshold is strictly `>`); `build_decode_kwargs` primary (T=0, `condition_on_previous_text=False`, no prompt) vs retry (temperature > 0, Thai preamble); env toggles `WHISPER_FP16`/`WHISPER_RETRY_TEMPERATURE`/`WHISPER_INITIAL_PROMPT`.
 - `test_wav_dump.py`: inert when `DUMP_CHUNKS_DIR` unset; writes well-formed 16 kHz mono 16-bit PCM; float32→int16 clamp; filename sanitization + zero-padded sort.
+- `test_summarizer.py`: `_is_looping` fires at exactly `min_repeats` identical trailing windows and never false-positives on repetitive JSON (`"owner":` keys); guard clauses (`window<=0`, `min_repeats<2`, `len < window*min_repeats`) → False; `StalledGenerationError` stores `.progressed`; retry policy via a fake `_summarize_once` — zero-progress stall retries once then raises, `progressed=True` (loop) raises without retry. `summarizer` imports only stdlib + `.config` at module scope, so this test runs with no `anthropic` installed (build the Summarizer via `object.__new__` to bypass `__init__`).
 
 ## `requirements.txt` (pin exactly)
 
@@ -279,16 +318,21 @@ SILENCE_THRESHOLD=0.01
 SILENCE_SECONDS=0.8
 MIN_CHUNK_SECONDS=1.0
 MAX_CHUNK_SECONDS=30.0
-SUMMARIZE_TIMEOUT_SECONDS=90
-MAX_PROMPT_CHARS=6000
-SUMMARY_MAX_TOKENS=4096
+SUMMARIZE_TIMEOUT_SECONDS=180
+MAX_PROMPT_CHARS=48000
+SUMMARY_MAX_TOKENS=8192
+STALL_TIMEOUT_SECONDS=20
+REPETITION_WINDOW_CHARS=300
+REPETITION_MIN_REPEATS=3
 ```
+
+`.env.example` must contain **exactly** the keys `config.py` reads (`_REQUIRED_ENV` + `_OPTIONAL_FLOAT_ENV` names). Runtime-only toggles (`DUMP_CHUNKS_DIR`, `WHISPER_FP16`, `WHISPER_RETRY_TEMPERATURE`, `WHISPER_INITIAL_PROMPT`) are read via `os.environ` by `transcriber.py`/`wav_dump.py` and deliberately do **not** appear here.
 
 ## Acceptance criteria
 
 1. `python3 -m compileall -q meeting_bot tests` exits 0.
-2. The six pure modules (`config`, `audio`, `chunker`, `transcript`, `summary_parse`, `wav_dump`) import with only numpy present (no discord/anthropic/mlx_whisper; `wav_dump` needs nothing but stdlib).
-3. Every class/function above exists with the documented signature.
+2. The pure modules (`config`, `audio`, `chunker`, `transcript`, `summary_parse`, `summarizer`, `wav_dump`) import with only stdlib (+ numpy for `audio`/`chunker`) present — no discord/anthropic/mlx_whisper; `wav_dump` and `summarizer` need nothing beyond stdlib.
+3. Every class/function above exists with the documented signature — including `Summarizer.summarize`, `_summarize_once`, `EmptySummaryError`, `StalledGenerationError(..., *, progressed)`, `render_markdown`, the six new `Config` fields, and `Transcript.to_prompt_text(max_chars=48000)`.
 4. `main.py` supports `--doctor` and `--help` without connecting.
 5. No tokens or secrets appear in any file.
-6. `.env.example` contains exactly the keys `config.py` reads.
+6. `.env.example` contains exactly the keys `config.py` reads (`_REQUIRED_ENV` + `_OPTIONAL_FLOAT_ENV` names), including `STALL_TIMEOUT_SECONDS`/`REPETITION_WINDOW_CHARS`/`REPETITION_MIN_REPEATS`. Runtime toggles (`DUMP_CHUNKS_DIR`, `WHISPER_FP16`, `WHISPER_RETRY_TEMPERATURE`, `WHISPER_INITIAL_PROMPT`) are not Config keys and must not appear.
