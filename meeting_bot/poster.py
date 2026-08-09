@@ -21,22 +21,49 @@ from .summary_parse import Summary
 log = logging.getLogger(__name__)
 
 _EMBED_TITLE = "📝 สรุปการประชุม"
-# Discord embed limits: 1024 per field, 4096 per description, 6000 total.
+# Discord embed limits: 1024 per field value, 4096 per description, and the
+# SUM of title + description + all field names/values + footer must stay <= 6000.
+_EMBED_TOTAL_MAX = 6000
 _FIELD_MAX = 1024
-# Conservative cap on the description so overview + 4 fields stay under the
-# embed's 6000-char total (the full overview lives in the attached file).
+# Soft cap on the overview inside the embed.  The full overview always lives in
+# the attached summary.md, so the embed only needs a scannable summary; the real
+# ceiling is the shared 6000-char pool enforced in ``build_embed``.
 _DESCRIPTION_MAX = 2000
 _TRUNCATE_NOTE = "…ดูรายละเอียดเพิ่มเติมในไฟล์แนบ"
 
+# Field names are fixed (non-value) embed text and count toward the 6000 total.
+_FIELD_NAMES = (
+    "หัวข้อที่พูดคุย",
+    "การตัดสินใจ",
+    "รายการที่ต้องทำ",
+    "คำถามที่ยังไม่ได้ข้อสรุป",
+)
+
 
 def _truncate(text: str, limit: int) -> str:
-    """Truncate ``text`` to ``limit`` chars, appending the attachment note."""
+    """Truncate ``text`` to **at most** ``limit`` chars, appending the note."""
+    if limit <= 0:
+        return ""
     if len(text) <= limit:
         return text
     budget = limit - len(_TRUNCATE_NOTE) - 1
     if budget <= 0:
-        return _TRUNCATE_NOTE
+        return _TRUNCATE_NOTE[:limit]
     return text[:budget] + "\n" + _TRUNCATE_NOTE
+
+
+def _fit_to_pool(desired: list[int], pool: int) -> list[int]:
+    """Scale per-piece desired char budgets to fit a shared ``pool``.
+
+    Returns budgets whose sum is ``<= pool``.  When the desired total already
+    fits, returns the desired values unchanged (nothing is truncated
+    needlessly); otherwise every piece is scaled down proportionally, so a
+    genuinely rich meeting can never blow Discord's 6000-char total embed budget.
+    """
+    total = sum(desired)
+    if total <= pool:
+        return list(desired)
+    return [d * pool // total for d in desired]
 
 
 def _duration_text(duration: timedelta) -> str:
@@ -59,37 +86,23 @@ def build_embed(
     channel name before posting.
     """
     title = meeting_title or "การประชุม"
-    embed = discord.Embed(
-        title=_EMBED_TITLE,
-        description=_truncate(summary.overview or title, _DESCRIPTION_MAX),
-        color=discord.Color.blurple(),
-        timestamp=started_at,
+    footer_text = (
+        f"{title} · ระยะเวลา {_duration_text(duration)} · "
+        f"ผู้เข้าร่วม {member_count} คน · {started_at:%d %b %Y}"
     )
 
-    topic_lines = []
-    for item in summary.topics:
-        if item.detail:
-            topic_lines.append(f"• **{item.title}** — {item.detail}")
-        else:
-            topic_lines.append(f"• **{item.title}**")
-    embed.add_field(
-        name="หัวข้อที่พูดคุย",
-        value=_truncate("\n".join(topic_lines) if topic_lines else "—", _FIELD_MAX),
-        inline=False,
-    )
+    overview_text = summary.overview or title
 
-    decision_lines = []
-    for item in summary.decisions:
-        if item.rationale:
-            decision_lines.append(f"• **{item.decision}** — {item.rationale}")
-        else:
-            decision_lines.append(f"• **{item.decision}**")
-    embed.add_field(
-        name="การตัดสินใจ",
-        value=_truncate("\n".join(decision_lines) if decision_lines else "—", _FIELD_MAX),
-        inline=False,
-    )
-
+    topic_text = "\n".join(
+        f"• **{item.title}** — {item.detail}" if item.detail else f"• **{item.title}**"
+        for item in summary.topics
+    ) or "—"
+    decision_text = "\n".join(
+        f"• **{item.decision}** — {item.rationale}"
+        if item.rationale
+        else f"• **{item.decision}**"
+        for item in summary.decisions
+    ) or "—"
     action_lines = []
     for item in summary.action_items:
         line = f"• {item.action}"
@@ -98,25 +111,40 @@ def build_embed(
         if item.due:
             line += f" (due: {item.due})"
         action_lines.append(line)
-    embed.add_field(
-        name="รายการที่ต้องทำ",
-        value=_truncate("\n".join(action_lines) if action_lines else "—", _FIELD_MAX),
-        inline=False,
-    )
+    action_text = "\n".join(action_lines) or "—"
+    question_text = "\n".join(f"• {q}" for q in summary.open_questions) or "—"
 
-    open_question_lines = [f"• {q}" for q in summary.open_questions]
-    embed.add_field(
-        name="คำถามที่ยังไม่ได้ข้อสรุป",
-        value=_truncate("\n".join(open_question_lines) if open_question_lines else "—", _FIELD_MAX),
-        inline=False,
+    # Discord caps the SUM of title + description + field names/values + footer
+    # at 6000.  Fixed text (title, field names, footer) is counted first, then
+    # the remaining pool is shared across the description and the four field
+    # values — so a rich meeting never overflows even when every section is at
+    # its per-item maximum (the full untruncated summary is in the attachment).
+    fixed = (
+        len(_EMBED_TITLE)
+        + len(footer_text)
+        + sum(len(name) for name in _FIELD_NAMES)
     )
+    texts = [overview_text, topic_text, decision_text, action_text, question_text]
+    desired = [
+        min(_DESCRIPTION_MAX, len(overview_text)),
+        min(_FIELD_MAX, len(topic_text)),
+        min(_FIELD_MAX, len(decision_text)),
+        min(_FIELD_MAX, len(action_text)),
+        min(_FIELD_MAX, len(question_text)),
+    ]
+    limits = _fit_to_pool(desired, _EMBED_TOTAL_MAX - fixed)
+    description = _truncate(overview_text, limits[0])
+    field_values = [_truncate(t, limits[i]) for i, t in enumerate(texts[1:], 1)]
 
-    embed.set_footer(
-        text=(
-            f"{title} · ระยะเวลา {_duration_text(duration)} · "
-            f"ผู้เข้าร่วม {member_count} คน · {started_at:%d %b %Y}"
-        )
+    embed = discord.Embed(
+        title=_EMBED_TITLE,
+        description=description,
+        color=discord.Color.blurple(),
+        timestamp=started_at,
     )
+    for name, value in zip(_FIELD_NAMES, field_values):
+        embed.add_field(name=name, value=value, inline=False)
+    embed.set_footer(text=footer_text)
     return embed
 
 
