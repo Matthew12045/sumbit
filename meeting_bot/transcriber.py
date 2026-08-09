@@ -41,6 +41,11 @@ _MAX_REPEAT_PERIOD = 10  # characters; covers single chars up to short syllables
 # ONCE with a small temperature bump + a Thai preamble to push the decoder off a
 # deterministic repetition attractor, and only dropped if the retry is still bad.
 #
+# Because loops never trip them, compression_ratio_threshold / logprob_threshold
+# are deliberately NOT passed to transcribe() — tightening them to catch loops
+# would flag ordinary Thai speech (similar low compression / high logprob) and
+# force temperature fallbacks on everything. Do not "add" them back in.
+#
 # Knobs are read from the environment (NOT Config) so the frozen Config
 # dataclass / .env.example key set / spec acceptance criterion 6 stay untouched.
 # WHISPER_FP16 must be constant for the whole process (ModelHolder caches the

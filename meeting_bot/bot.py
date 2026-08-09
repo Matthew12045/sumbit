@@ -274,10 +274,15 @@ class MeetingBot(discord.Client):
             else:
                 try:
                     log.info("summarizer prompt length: %d chars", len(prompt_text))
-                    summarizer = Summarizer(self.cfg)
-                    summary_text = await asyncio.to_thread(
-                        summarizer.summarize, prompt_text
-                    )
+
+                    def _summarize():
+                        # Construct off the loop too: importing anthropic +
+                        # building the httpx client (~0.5-2s first call) must
+                        # never stall the gateway heartbeat.
+                        summarizer = Summarizer(self.cfg)
+                        return summarizer.summarize(prompt_text)
+
+                    summary_text = await asyncio.to_thread(_summarize)
                     log.info("summarizer raw response (first 1000 chars): %s", summary_text[:1000])
                     summary = parse_summary(summary_text)
                     log.info("parsed summary: topics=%d decisions=%d action_items=%d",
