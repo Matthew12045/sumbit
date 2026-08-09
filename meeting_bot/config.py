@@ -65,7 +65,11 @@ def load_config(path: str | os.PathLike = ".env") -> Config:
     from dotenv import load_dotenv  # lazy: python-dotenv is not stdlib/numpy
 
     path = os.fspath(path)
-    load_dotenv(path)
+    # `.env` must win over the process environment.  load_dotenv defaults to
+    # override=False, so a shell-exported ANTHROPIC_BASE_URL (e.g. a Claude
+    # Code alias pointing at api.deepseek.com) would silently shadow this
+    # repo's gateway.9arm.co value and every --doctor probe would 401.
+    load_dotenv(path, override=True)
 
     def _required(name: str) -> str:
         value = os.getenv(name, "").strip()

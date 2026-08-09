@@ -45,6 +45,7 @@ class MeetingSink(Sink):
         self._frame_count = 0
         self._ever_received_frame = False
         self._resample_failures = 0
+        self._grace_until: float | None = None
 
     @property
     def last_frame_time(self) -> float:
@@ -65,6 +66,17 @@ class MeetingSink(Sink):
     def resample_failures(self) -> int:
         """Total resample failures since the sink was created."""
         return self._resample_failures
+
+    def set_grace_until(self, until: float | None) -> None:
+        """Discard incoming PCM until the given monotonic deadline.
+
+        The bot arms this after every successful ``channel.connect()``
+        (initial join and mid-meeting reconnects).  DAVE takes a few seconds
+        to derive per-sender keys after a fresh connect, and frames in that
+        window fail ``NoValidCryptorFound`` — dropping them keeps the
+        garbage out of the chunker/transcriber.
+        """
+        self._grace_until = until
 
     def diagnostics(self) -> dict:
         """Return diagnostic state for runtime debugging (thread-safe)."""
@@ -107,6 +119,19 @@ class MeetingSink(Sink):
             pcm = bytes(pcm)
         if not isinstance(pcm, (bytes, bytearray)) or not pcm:
             return
+
+        # Post-connect grace period: DAVE takes a few seconds to derive
+        # per-sender keys after a fresh (re)connect, and frames in that window
+        # fail NoValidCryptorFound. Drop them rather than feed garbage into the
+        # chunker/transcriber. Still update last_frame_time so the watchdog
+        # sees a live pipeline.
+        grace_until = self._grace_until
+        if grace_until is not None:
+            if time.monotonic() < grace_until:
+                self._last_frame_time = time.monotonic()
+                return
+            self._grace_until = None
+            log.info("audio grace period ended — accepting frames")
 
         # Debug: log raw PCM properties on first frame
         if self._frame_count == 0:

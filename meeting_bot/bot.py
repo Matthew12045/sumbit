@@ -28,6 +28,10 @@ _VOICE_CONNECT_MAX_RETRIES = 3
 _VOICE_CONNECT_BACKOFFS = (2.0, 5.0, 10.0)
 _VOICE_MONITOR_POLL = 5.0
 _VOICE_MONITOR_MAX_FAILURES = 3
+# Discard incoming PCM this long after a fresh voice (re)connect: DAVE takes
+# ~5s to derive per-sender keys, and frames in that window fail
+# NoValidCryptorFound. Small buffer over the observed ~5s.
+_AUDIO_GRACE_SECONDS = 6.5
 
 
 class MeetingBot(discord.Client):
@@ -364,6 +368,7 @@ class MeetingBot(discord.Client):
                     attempt + 1,
                     _VOICE_CONNECT_MAX_RETRIES,
                 )
+                self._arm_audio_grace()
                 return vc
             except Exception as exc:
                 log.warning(
@@ -405,6 +410,22 @@ class MeetingBot(discord.Client):
         except Exception:
             log.exception("failed to post voice-connect-error note")
         return None
+
+    def _arm_audio_grace(self) -> None:
+        """Discard incoming PCM for _AUDIO_GRACE_SECONDS after a fresh connect.
+
+        DAVE takes a few seconds to derive per-sender keys after a (re)connect,
+        and frames in that window fail NoValidCryptorFound. The sink drops them
+        so garbage never reaches the chunker/transcriber.
+        """
+        sink = self._sink
+        if sink is None:
+            return
+        sink.set_grace_until(time.monotonic() + _AUDIO_GRACE_SECONDS)
+        log.info(
+            "audio grace period started — discarding PCM for %.1fs",
+            _AUDIO_GRACE_SECONDS,
+        )
 
     @staticmethod
     def _log_dave_diag(vc) -> None:
@@ -471,6 +492,7 @@ class MeetingBot(discord.Client):
                     self._voice_client = None
                 vc = await channel.connect()
                 self._voice_client = vc
+                self._arm_audio_grace()
                 await channel.guild.change_voice_state(
                     channel=channel, self_mute=True, self_deaf=True,
                 )
