@@ -350,6 +350,13 @@ class MeetingBot(discord.Client):
         Returns the VoiceClient on success, or None if all retries exhausted.
         """
         for attempt in range(_VOICE_CONNECT_MAX_RETRIES):
+            if self.is_closed():
+                # Bot is shutting down (e.g. Ctrl+C) — the main gateway
+                # websocket is already closing, so any further connect
+                # attempt will only fail noisily with
+                # ClientConnectionResetError. Bail out quietly instead.
+                log.debug("voice connect aborted — client is closing")
+                return None
             try:
                 vc = await channel.connect()
                 log.info(
@@ -429,6 +436,11 @@ class MeetingBot(discord.Client):
         while self._meeting_active:
             await asyncio.sleep(_VOICE_MONITOR_POLL)
             if not self._meeting_active:
+                return
+            if self.is_closed():
+                # Bot is shutting down — don't attempt a reconnect against a
+                # gateway websocket that's already closing (only produces
+                # confusing ClientConnectionResetError/TimeoutError noise).
                 return
             vc = self._voice_client
             if vc is not None and vc.is_connected():

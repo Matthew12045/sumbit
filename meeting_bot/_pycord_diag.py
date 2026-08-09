@@ -178,9 +178,53 @@ _dave_fail_count = 0
 _dave_success_count = 0
 _MAX_DAVE_LOGS = 5
 
+# --- periodic failure-rate visibility ---------------------------------
+#
+# NOTE on what set_passthrough_mode actually fixes: it only prevents
+# UnencryptedWhenPassthroughDisabled (raised when a plaintext packet
+# arrives during a transition window). It does NOT fix
+# NoValidCryptorFound (raised when a packet IS DAVE-encrypted but the
+# local MLS session has no cryptor yet for that specific sender) —
+# that failure mode can only resolve once davey finishes deriving the
+# sender's key, which is outside application control. Capping the
+# per-packet error log at _MAX_DAVE_LOGS hid just how much audio this
+# was costing (a real run lost ~all audio despite these patches being
+# active), so we log a periodic rate summary below in addition to the
+# first few detailed failures.
+_window_fail = 0
+_window_success = 0
+_last_summary_mono = 0.0
+_SUMMARY_INTERVAL_SECONDS = 5.0
+
+
+def _maybe_log_summary() -> None:
+    global _window_fail, _window_success, _last_summary_mono
+
+    now = time.monotonic()
+    if _last_summary_mono == 0.0:
+        _last_summary_mono = now
+        return
+    if now - _last_summary_mono < _SUMMARY_INTERVAL_SECONDS:
+        return
+    if _window_fail or _window_success:
+        total = _window_fail + _window_success
+        log.warning(
+            "DIAG DAVE decrypt rate (last %.0fs): %d/%d packets failed "
+            "(%.0f%%) — ongoing failures here are NOT fixed by the "
+            "passthrough patches (see NoValidCryptorFound note)",
+            _SUMMARY_INTERVAL_SECONDS,
+            _window_fail,
+            total,
+            100.0 * _window_fail / total if total else 0.0,
+        )
+    _window_fail = 0
+    _window_success = 0
+    _last_summary_mono = now
+
 
 def _patched_decrypt_rtp(self, packet: Any) -> bytes:
     global _orig_decrypt_rtp, _dave_fail_count, _dave_success_count
+    global _window_fail, _window_success
 
     # Call the original first — it does NaCl decrypt + DAVE decrypt.
     result = _orig_decrypt_rtp(self, packet)
@@ -195,6 +239,7 @@ def _patched_decrypt_rtp(self, packet: Any) -> bytes:
 
         if uid is not None and decrypted == b"":
             _dave_fail_count += 1
+            _window_fail += 1
             if _dave_fail_count <= _MAX_DAVE_LOGS:
                 dave_status = getattr(dave, "status", "unknown")
                 dave_ready = getattr(dave, "ready", False)
@@ -209,11 +254,22 @@ def _patched_decrypt_rtp(self, packet: Any) -> bytes:
                     dave_status,
                     list(user_ids) if user_ids else "none",
                 )
+                if _dave_fail_count == _MAX_DAVE_LOGS:
+                    log.warning(
+                        "DIAG DAVE: reached %d failure logs — suppressing "
+                        "per-packet detail, switching to periodic rate "
+                        "summaries every %.0fs",
+                        _MAX_DAVE_LOGS,
+                        _SUMMARY_INTERVAL_SECONDS,
+                    )
 
             # FIX: Reactively enable passthrough when DAVE decrypt starts
-            # failing.  This catches transition windows that the proactive
-            # patch in execute_dave_transition might miss (e.g., epoch
-            # transitions triggered by mls_prepare_epoch).
+            # failing. This only helps the UnencryptedWhenPassthroughDisabled
+            # case (catches transition windows the proactive patch in
+            # execute_dave_transition might miss, e.g. epoch transitions
+            # triggered by mls_prepare_epoch) — it is a no-op against
+            # NoValidCryptorFound, which is the more common failure seen
+            # in practice. Still harmless to call, so left in place.
             if _dave_fail_count == 1:
                 try:
                     dave.set_passthrough_mode(True, _PASSTHROUGH_GRACE_SECONDS)
@@ -230,6 +286,7 @@ def _patched_decrypt_rtp(self, packet: Any) -> bytes:
                     )
         elif uid is not None and decrypted and decrypted != b"":
             _dave_success_count += 1
+            _window_success += 1
             if _dave_success_count == 1:
                 log.info(
                     "DIAG DAVE decrypt SUCCESS (first): ssrc=%s uid=%s "
@@ -238,6 +295,8 @@ def _patched_decrypt_rtp(self, packet: Any) -> bytes:
                     uid,
                     len(decrypted),
                 )
+
+        _maybe_log_summary()
 
     return result
 
@@ -251,6 +310,7 @@ _orig_reinit_dave = None
 
 async def _patched_reinit_dave(self) -> None:
     global _orig_reinit_dave, _dave_fail_count, _dave_success_count
+    global _window_fail, _window_success, _last_summary_mono
 
     proto = getattr(self, "dave_protocol_version", "?")
     old_session = getattr(self, "dave_session", None)
@@ -295,6 +355,9 @@ async def _patched_reinit_dave(self) -> None:
     # Reset failure/success counters so fresh diagnostics start each session.
     _dave_fail_count = 0
     _dave_success_count = 0
+    _window_fail = 0
+    _window_success = 0
+    _last_summary_mono = 0.0
 
 
 # ---------------------------------------------------------------------------
