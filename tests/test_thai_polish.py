@@ -279,6 +279,43 @@ class TestParsePolished:
         with pytest.raises(ValueError):
             _parse_polished(raw, 1, expected=expected)
 
+    def test_wrong_decision_count_raises(self):
+        """Both directions: fewer AND more decisions than the input had."""
+        import pytest
+
+        expected = _PolishInput(
+            overview="orig",
+            topics=[],
+            decisions=[{"decision": "c", "rationale": ""}],
+            action_items=[],
+            open_questions=[],
+        )
+        fewer = json.dumps({
+            "overview": "x",
+            "topics": [],
+            "decisions": [],
+            "action_items": [],
+            "open_questions": [],
+            "edits_needed": False,
+            "edit_notes": [],
+        }, ensure_ascii=False)
+        more = json.dumps({
+            "overview": "x",
+            "topics": [],
+            "decisions": [
+                {"decision": "c", "rationale": ""},
+                {"decision": "invented", "rationale": "junk"},
+            ],
+            "action_items": [],
+            "open_questions": [],
+            "edits_needed": False,
+            "edit_notes": [],
+        }, ensure_ascii=False)
+        with pytest.raises(ValueError):
+            _parse_polished(fewer, 1, expected=expected)
+        with pytest.raises(ValueError):
+            _parse_polished(more, 1, expected=expected)
+
     def test_matching_shape_parses(self):
         raw = json.dumps({
             "overview": "x",
@@ -335,7 +372,9 @@ class TestPolishConvergence:
         s = _make_summary()
         p = _make_polisher()
         result = p.polish(s)
-        assert result is not None
+        # The rebuilt Summary must carry the original's polished fields.
+        assert _fields(_to_input(result)) == _fields(_to_input(s))
+        assert p.last_stats == {"passes": 1, "outcome": "converged"}
 
     def test_converges_after_edits(self):
         """First pass suggests edits, second pass converges."""
@@ -364,7 +403,14 @@ class TestPolishConvergence:
         ]
         p = _make_polisher(fake_responses=responses)
         result = p.polish(s)
-        assert result is not None
+        # Pass 1's edited text was accepted; pass 2 saw zero diffs.
+        assert result.overview == "ภาพรวมที่ปรบปรุงแล้ว"
+        assert _fields(_to_input(result)) == (
+            "ภาพรวมที่ปรบปรุงแล้ว",
+            ("พิจารณางบประมาณปหนา",),
+            ("เพราะจําเปนตองใชงาน",),
+        )
+        assert p.last_stats == {"passes": 2, "outcome": "converged"}
 
     def test_safety_cap_returns_original(self):
         """If max_passes is hit without convergence, return the original."""
@@ -388,6 +434,7 @@ class TestPolishConvergence:
         result = p.polish(s)
         # Should return original on safety cap
         assert result is s
+        assert p.last_stats == {"passes": 3, "outcome": "cap"}
 
     def test_stable_text_converges_even_when_edits_claimed(self):
         """Zero field diffs = converged, regardless of edits_needed."""
@@ -425,6 +472,7 @@ class TestParseFailureFallsBackToOriginal:
         assert result is s
         assert result.overview == "ภาพรวมของการประชุมวันนี้"
         assert len(result.topics) == 1
+        assert p.last_stats == {"passes": 1, "outcome": "hard_failure"}
 
     def test_shape_mismatch_returns_original(self):
         """A pass that drops topics must fall back to the original."""
@@ -440,6 +488,28 @@ class TestParseFailureFallsBackToOriginal:
         }, ensure_ascii=False)
         p = _make_polisher(fake_responses=[dropped_topic])
         assert p.polish(s) is s
+        assert p.last_stats == {"passes": 1, "outcome": "hard_failure"}
+
+    def test_extra_decisions_returns_original(self):
+        """A pass that INVENTS decisions (count > input) must also fall back —
+        this mirrors the real OpenTyphoon failure seen in e2e probing where
+        open questions were re-classified as extra decisions."""
+        s = _make_summary()  # has exactly 1 decision
+        inflated = json.dumps({
+            "overview": "x",
+            "topics": [{"title": "งบประมาณ", "detail": "พิจารณางบประมาณปหนา"}],
+            "decisions": [
+                {"decision": "อนุมัติงบประมาณ", "rationale": "เพราะจําเปนตองใชงาน"},
+                {"decision": "ประเด็นแปลกปลอม", "rationale": "ไม่ได้อยู่ในอินพุต"},
+            ],
+            "action_items": [],
+            "open_questions": [],
+            "edits_needed": False,
+            "edit_notes": [],
+        }, ensure_ascii=False)
+        p = _make_polisher(fake_responses=[inflated])
+        assert p.polish(s) is s
+        assert p.last_stats == {"passes": 1, "outcome": "hard_failure"}
 
     def test_blanked_out_text_returns_original(self):
         """edits_needed=false with emptied fields must NOT be accepted."""
@@ -454,7 +524,9 @@ class TestParseFailureFallsBackToOriginal:
             "edit_notes": [],
         }, ensure_ascii=False)
         p = _make_polisher(fake_responses=[blanking])
-        assert p.polish(s) is s
+        result = p.polish(s)
+        assert result is s
+        assert p.last_stats == {"passes": 1, "outcome": "blanked"}
 
     def test_protected_fields_survive_mangled_output(self):
         """Titles/labels/action_items/open_questions come from the ORIGINAL,
@@ -475,8 +547,106 @@ class TestParseFailureFallsBackToOriginal:
         assert result.overview == "ภาพรวมที่ขัดเกลาแล้ว"
         assert result.topics[0].title == "งบประมาณ"  # protected title
         assert result.decisions[0].decision == "อนุมัติงบประมาณ"  # protected label
-        assert len(result.action_items) == 1  # passed through
-        assert len(result.open_questions) == 1  # passed through
+        # Passed through BYTE-IDENTICAL to the original items, not merely
+        # same-length: the model returned [] for both.
+        assert result.action_items == s.action_items
+        assert result.open_questions == s.open_questions
+
+
+# ---------------------------------------------------------------------------
+# last_stats observability
+# ---------------------------------------------------------------------------
+
+class TestLastStats:
+    """ThaiPolisher.last_stats must record {passes, outcome} for every path."""
+
+    def test_skipped_on_empty_raw(self):
+        s = Summary(
+            overview="", topics=[], decisions=[],
+            action_items=[], open_questions=[], raw="",
+        )
+        p = _make_polisher()
+        assert p.polish(s) is s
+        assert p.last_stats == {"passes": 0, "outcome": "skipped"}
+
+    def test_final_edit_outcome(self):
+        """Fields changed + edits_needed=false (no blanking) = final_edit."""
+        s = _make_summary()
+        improved = json.dumps({
+            "overview": "ภาพรวมที่ขัดเกลาแล้ว",
+            "topics": [{"title": "งบประมาณ", "detail": "พิจารณางบประมาณปหนา"}],
+            "decisions": [{"decision": "อนุมัติงบประมาณ", "rationale": "เพราะจําเปนตองใชงาน"}],
+            "action_items": [{"action": "เตรียมนําเสนอ", "owner": "สมชาย", "due": "2569-01-15"}],
+            "open_questions": ["แผนสำรองเปนอย่างไร"],
+            "edits_needed": False,
+            "edit_notes": [],
+        }, ensure_ascii=False)
+        p = _make_polisher(fake_responses=[improved])
+        result = p.polish(s)
+        assert result.overview == "ภาพรวมที่ขัดเกลาแล้ว"
+        assert p.last_stats == {"passes": 1, "outcome": "final_edit"}
+
+
+# ---------------------------------------------------------------------------
+# Log emission (kienthai.md: outcomes distinguishable from logs alone)
+# ---------------------------------------------------------------------------
+
+class TestLogEmission:
+    def _messages(self, caplog, polisher, summary):
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="meeting_bot.thai_polish"):
+            polisher.polish(summary)
+        return [record.message for record in caplog.records]
+
+    def test_convergence_logged(self, caplog):
+        msgs = self._messages(caplog, _make_polisher(), _make_summary())
+        assert any("converged after 1 pass(es)" in m for m in msgs)
+
+    def test_final_edit_logged(self, caplog):
+        improved = json.dumps({
+            "overview": "ภาพรวมที่ขัดเกลาแล้ว",
+            "topics": [{"title": "งบประมาณ", "detail": "พิจารณางบประมาณปหนา"}],
+            "decisions": [{"decision": "อนุมัติงบประมาณ", "rationale": "เพราะจําเปนตองใชงาน"}],
+            "action_items": [{"action": "เตรียมนําเสนอ", "owner": "สมชาย", "due": "2569-01-15"}],
+            "open_questions": ["แผนสำรองเปนอย่างไร"],
+            "edits_needed": False,
+            "edit_notes": [],
+        }, ensure_ascii=False)
+        msgs = self._messages(caplog, _make_polisher(fake_responses=[improved]), _make_summary())
+        assert any("accepted final edit after 1 pass(es)" in m for m in msgs)
+
+    def test_safety_cap_logged(self, caplog):
+        alternating = [
+            json.dumps({
+                "overview": f"v{i}", "topics": [{"title": "a", "detail": f"d{i}"}],
+                "decisions": [{"decision": "c", "rationale": "d"}],
+                "action_items": [{"action": "e", "owner": "f", "due": "g"}],
+                "open_questions": ["h"],
+                "edits_needed": True,
+                "edit_notes": ["keep editing"],
+            }, ensure_ascii=False)
+            for i in range(8)
+        ]
+        msgs = self._messages(caplog, _make_polisher(fake_responses=alternating), _make_summary())
+        assert any("hit safety cap (3 passes)" in m for m in msgs)
+
+    def test_hard_failure_logged(self, caplog):
+        msgs = self._messages(caplog, _make_polisher(fake_responses=["garbage"]), _make_summary())
+        assert any("hard failure on pass 1" in m for m in msgs)
+
+    def test_blanked_logged(self, caplog):
+        blanking = json.dumps({
+            "overview": "",
+            "topics": [{"title": "งบประมาณ", "detail": ""}],
+            "decisions": [{"decision": "อนุมัติงบประมาณ", "rationale": ""}],
+            "action_items": [],
+            "open_questions": [],
+            "edits_needed": False,
+            "edit_notes": [],
+        }, ensure_ascii=False)
+        msgs = self._messages(caplog, _make_polisher(fake_responses=[blanking]), _make_summary())
+        assert any("emptied polished text" in m for m in msgs)
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +669,7 @@ class TestApiFailureFallback:
 
         result = p.polish(s)
         assert result is s
+        assert p.last_stats == {"passes": 1, "outcome": "hard_failure"}
 
     def test_empty_response_returns_original(self):
         """If the model returns None content, return original."""
