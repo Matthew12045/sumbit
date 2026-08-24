@@ -25,24 +25,27 @@ Discord voice channel
 
    **macOS prerequisite:** `brew install opus` is required for voice (py-cord ships libopus only as Windows DLLs). The bot's `doctor()` checks `ctypes.util.find_library("opus")`. First whisper run downloads ~3 GB into `~/.cache/huggingface` (host default is fine; set `HF_HOME` only if the cache must live elsewhere).
 2. **STT:** local `mlx-whisper`, model `mlx-community/whisper-large-v3-mlx` (non-turbo — large-v3-turbo is prone to confident repetition-loop hallucinations on Thai), `language="th"`. No cloud API. Runs on the same Apple Silicon MacBook as the AI gateway, so GPU contention is a real concern — serialized worker, fp16, model cached once. The transcriber hardens the decode (`condition_on_previous_text=False`, greedy T=0) and re-decodes once with a small temperature bump + Thai preamble when a decode is flagged garbage; see `tools/offline_repro.py` for an A/B harness.
-3. **Summarization:** the user's own gateway via the **Anthropic-compatible** API — `anthropic` SDK, `base_url=https://gateway.9arm.co`, `auth_token` from env (`ANTHROPIC_AUTH_TOKEN`), model `qwen3.6-35b-a3b`. **Do not put `/v1` in the base URL** (the SDK appends `/v1/messages`). The call is a **blocking** `client.messages.create()` — probing the gateway (`tools/probe_stream.py`) showed it buffers the whole completion server-side (SSE events arrive in a burst near the end), so streaming adds no early-abort value; the SDK client timeout `SUMMARIZE_TIMEOUT_SECONDS=180` is the ceiling. Prompt budget `MAX_PROMPT_CHARS=48000` (128k-context gateway), output budget `SUMMARY_MAX_TOKENS=8192`. qwen's structured-output reliability is the known risk — the summary parse must never raise. The completed output is checked post-hoc for an exact-repeat loop (`REPETITION_WINDOW_CHARS` × `REPETITION_MIN_REPEATS`); a loop raises `StalledGenerationError(progressed=True)` (never retried), which `bot.py` surfaces as a visible ⚠️ note in the target channel. An empty completion raises `EmptySummaryError` (never retried).
+3. **Summarization:** the user's own gateway via the **Anthropic-compatible** API — `anthropic` SDK, `base_url=https://gateway.9arm.co`, `auth_token` from env (`ANTHROPIC_AUTH_TOKEN`), model `qwen3.8-27b-fp8` (quantized variant, 128k-token context; must match the gateway's allowlist exactly — the doctor probe catches mismatches). **Do not put `/v1` in the base URL** (the SDK appends `/v1/messages`). The call is a **blocking** `client.messages.create()` — probing the gateway (`tools/probe_stream.py`) showed it buffers the whole completion server-side (SSE events arrive in a burst near the end), so streaming adds no early-abort value; the SDK client timeout `SUMMARIZE_TIMEOUT_SECONDS=300` is the ceiling. Prompt budget `MAX_PROMPT_CHARS=135000` (declared 128k-token window on the fp8 variant; measured 2026-08-25 at ≈1.23 chars/token for Thai prompt text — 135k chars ≈110k tokens, ~18k-token headroom for system + full output; re-measure from `tools/e2e_summarize_probe.py` if the model changes), output budget `SUMMARY_MAX_TOKENS=8192`. qwen's structured-output reliability is the known risk — the summary parse must never raise. The completed output is checked post-hoc for an exact-repeat loop (`REPETITION_WINDOW_CHARS` × `REPETITION_MIN_REPEATS`); a loop raises `StalledGenerationError(progressed=True)` (never retried), which `bot.py` surfaces as a visible ⚠️ note in the target channel. An empty completion raises `EmptySummaryError` (never retried).
 4. **Secrets/config:** `.env` (never committed) via python-dotenv. A `.env.example` mirrors every key with placeholders and comments, no real secrets.
 
 ## File tree — produce exactly this
 
 ```
 meeting_bot/
-  __init__.py          # __version__ = "0.1.0"; re-export Config, MeetingBot
+  __init__.py          # __version__ = "0.1.0"; lazy re-export Config, MeetingBot, ThaiPolisher
   config.py            # Config dataclass, load_config(), doctor()
   audio.py             # resample + RMS helpers (numpy only)
   chunker.py           # SilenceChunker, Segment (numpy/stdlib only)
   sink.py              # MeetingSink(discord.sinks.Sink) per-user PCM capture
   transcriber.py       # Transcriber: background mlx-whisper worker
   transcript.py        # TranscriptEvent, Transcript accumulator (stdlib only)
+  rag_store.py         # Chunk, chunk_transcript(), VectorIndex, truncate_block (numpy/stdlib only)
+  embedder.py          # Embedder: local MLX sentence embeddings (lazy mlx_embedding_models import)
   summary_parse.py     # Summary, TopicItem, DecisionItem, ActionItem, parse_summary() (stdlib only)
   summarizer.py        # Summarizer: BLOCKING anthropic gateway call (lazy anthropic import)
+  thai_polish.py       # ThaiPolisher: kien-thai audit+fix loop via OpenTyphoon (lazy openai usage)
   poster.py            # build_embed(), render_markdown(), Poster
-  bot.py               # MeetingBot(discord.Client): voice trigger + orchestration
+  bot.py               # MeetingBot(discord.Bot): voice trigger, /leave + /join slash commands, orchestration
   main.py              # argparse entrypoint: run | --doctor
   __main__.py          # raise SystemExit(main())
   wav_dump.py          # env-gated DUMP_CHUNKS_DIR .wav writer (stdlib only)
@@ -55,11 +58,15 @@ tests/
   test_wav_dump.py
   test_summarizer.py
   test_poster.py
+  test_thai_polish.py
+  test_rag_store.py
+  test_embedder.py
+  test_bot_rejoin.py
 requirements.txt
 .env.example
 ```
 
-**Import rule (load-bearing).** `config.py`, `audio.py`, `chunker.py`, `transcript.py`, `summary_parse.py`, `summarizer.py`, `wav_dump.py` must import **only stdlib + numpy** at module scope (`wav_dump.py` is stdlib-only; `summarizer.py` imports only `logging`, `time`, and `.config` at module scope). `summarizer.py` imports `anthropic` **lazily** (inside `__init__`/methods, not at module scope). `sink.py`, `bot.py`, `poster.py` may import `discord`. `config.py` imports `dotenv`/`load_dotenv` **inside `load_config()` only** — python-dotenv is neither stdlib nor numpy, so a module-scope import breaks the pure-import rule. This lets the pure modules be imported and tested without the heavy deps installed.
+**Import rule (load-bearing).** `config.py`, `audio.py`, `chunker.py`, `transcript.py`, `summary_parse.py`, `summarizer.py`, `wav_dump.py` **and the new `rag_store.py`** must import **only stdlib + numpy** at module scope (`wav_dump.py` is stdlib-only; `summarizer.py` imports only `logging`, `time`, and `.config` at module scope). `summarizer.py` imports `anthropic` **lazily** (inside `__init__`/methods, not at module scope); `embedder.py` likewise lazy-imports `mlx_embedding_models` inside `Embedder.__init__`; `thai_polish.py` imports `openai` at module scope but is itself imported lazily by the package `__getattr__`. `sink.py`, `bot.py`, `poster.py` may import `discord`. `config.py` imports `dotenv`/`load_dotenv` **inside `load_config()` only** — python-dotenv is neither stdlib nor numpy, so a module-scope import breaks the pure-import rule. This lets the pure modules be imported and tested without the heavy deps installed.
 
 ## Module contracts
 
@@ -73,23 +80,34 @@ class Config:
     target_channel_id: int
     anthropic_base_url: str      # no trailing /v1 (the SDK appends /v1/messages)
     anthropic_auth_token: str
-    gateway_model: str           # qwen3.6-35b-a3b
-    whisper_model: str           # mlx-community/whisper-large-v3-mlx
+    gateway_model: str           # qwen3.8-27b-fp8
+    whisper_model: str           # mlx-community/whisper-large-v3-mlx (see STT decision below)
     whisper_language: str        # "th"
     silence_threshold: float = 0.01     # RMS speech threshold (~ −40 dBFS)
     silence_seconds: float = 0.8        # trailing silence to close a chunk
     min_chunk_seconds: float = 1.0      # shorter closed chunks are dropped
     max_chunk_seconds: float = 30.0     # force-close cap
-    summarize_timeout_seconds: float = 180.0  # SDK client timeout for gateway
-    max_prompt_chars: int = 48000      # transcript truncation limit (128k-context gateway)
+    summarize_timeout_seconds: float = 300.0  # SDK client timeout for gateway
+    max_prompt_chars: int = 135000      # transcript truncation limit (128k-context fp8 gateway)
     summary_max_tokens: int = 8192     # gateway output-token budget (qwen thinking + richer schema)
     repetition_window_chars: int = 300   # exact-repeat loop detection window
     repetition_min_repeats: int = 3      # identical consecutive windows before declaring a loop
+    rag_enabled: bool = True             # per-meeting RAG retrieval over the transcript
+    embedding_model: str = "BAAI/bge-m3" # local MLX embeddings for RAG
+    rag_top_k: int = 8                   # top-k chunks retrieved per query
+    rag_chunk_chars: int = 800           # sliding-window chunk size (chars)
+    rag_overlap_chars: int = 150         # trailing lines repeated per chunk
+    polish_enabled: bool = False          # kien-thai Thai-writing audit+fix loop
+    polish_api_key: str = ""              # OpenAI-compatible key for OpenTyphoon
+    polish_base_url: str = "https://api.opentyphoon.ai/v1"
+    polish_model: str = "typhoon-v2.5-30b-a3b-instruct"
+    polish_max_passes: int = 20
+    polish_timeout_seconds: float = 120.0
 
 def load_config(path: str | os.PathLike = ".env") -> Config: ...
 def doctor(cfg: Config) -> list[str]:   # list of "ok: ..."/"fail: ..." lines
 ```
-`load_config` reads `.env` with `python-dotenv` (imported inside the function), validates required keys present and non-empty, raises a clear error naming the missing key. `doctor` returns one `ok: ...`/`fail: ...` line per check and **never raises**: all required keys present; `discord`/`mlx_whisper`/`anthropic`/`numpy` importable (each individually — a missing one is a `fail` line, not an exception); system `libopus` resolvable via `ctypes.util.find_library("opus")`; whisper model name non-empty; and a **gateway probe**: construct the anthropic client from cfg and call `messages.create(model=cfg.gateway_model, max_tokens=1)` with a 30 s timeout and one retry on timeout only (the self-hosted qwen thinking model can exceed 10 s on cold load, so a slow-but-up gateway must not fail the check) — `ok` iff no exception and HTTP 2xx, `fail` on 401/403 (bad token), network error, or two consecutive timeouts, `fail` (not an exception) if `anthropic` isn't installed. Never log the auth token.
+`load_config` reads `.env` with `python-dotenv` (imported inside the function), validates required keys present and non-empty, raises a clear error naming the missing key. `doctor` returns one `ok: ...`/`fail: ...` line per check and **never raises**: all required keys present; `discord`/`mlx_whisper`/`anthropic`/`numpy` importable (each individually — a missing one is a `fail` line, not an exception); system `libopus` resolvable via `ctypes.util.find_library("opus")`; whisper model name non-empty; a **gateway probe**: construct the anthropic client from cfg and call `messages.create(model=cfg.gateway_model, max_tokens=1)` with a 30 s timeout and one retry on timeout only (the self-hosted qwen thinking model can exceed 10 s on cold load, so a slow-but-up gateway must not fail the check) — `ok` iff no exception and HTTP 2xx, `fail` on 401/403 (bad token), network error, or two consecutive timeouts, `fail` (not an exception) if `anthropic` isn't installed. When `polish_enabled`: a key-presence check plus a cheap **OpenTyphoon reachability probe** (`max_tokens=1`, 15 s timeout, ok/fail line — never raises, key never logged). When `rag_enabled`: an `mlx_embedding_models` importability line naming `EMBEDDING_MODEL`. Never log any auth token.
 
 ### `audio.py` (pure numpy)
 ```python
@@ -166,8 +184,42 @@ class Transcript:
     def is_empty(self) -> bool: ...
 ```
 
-### `summary_parse.py` (pure stdlib — the reliability mitigation)
+### `rag_store.py` (pure stdlib + numpy — per-meeting RAG index)
 ```python
+@dataclass(frozen=True)
+class Chunk:
+    chunk_id: int
+    header: str        # "[MM:SS–MM:SS]" time span the chunk covers
+    text: str          # complete "[MM:SS] speaker: text" lines, newline-joined
+    start_sec: float   # offset of the chunk's first line from meeting start
+    def as_embedding_text(self) -> str: ...  # header + "\n" + text
+
+def chunk_transcript(events, started_at, chunk_chars=800,
+                     overlap_chars=150) -> list[Chunk]: ...
+def truncate_block(text: str, max_chars: int) -> str: ...
+class VectorIndex:
+    def __len__(self) -> int: ...
+    def add(self, vectors, chunks: list[Chunk]) -> None: ...
+    def query(self, vector, k: int) -> list[tuple[Chunk, float]]: ...
+    def query_multi(self, vectors, k: int) -> list[tuple[Chunk, float]]: ...
+```
+- `chunk_transcript` renders lines exactly like `Transcript.to_prompt_text` (`[MM:SS] speaker: text`, chronological), packs them greedily up to `chunk_chars`, **never splits a line** (an oversized line becomes its own chunk), and repeats trailing lines totalling ≤ `overlap_chars` at the head of the next chunk (`0` ⇒ no overlap). Returns `[]` for an empty transcript.
+- `VectorIndex` stores L2-normalized float32 rows; cosine similarity is a plain dot product. `add` raises on length/dimension mismatch; zero rows stay zero. `query` returns top-k `(chunk, score)` best-first; empty-index queries return `[]`. `query_multi` unions the top-k hits per query row, dedupes by chunk keeping the **max** score, and re-sorts **chronologically** so the summarized excerpt reads in meeting order.
+- `truncate_block` mirrors `Transcript.to_prompt_text` truncation semantics (whole lines, single oversized line sliced, `...(truncated)` suffix).
+- Brute-force by design — hundreds of chunks per meeting needs no ANN. Nothing persists across meetings.
+
+### `embedder.py` (lazy `mlx_embedding_models` import)
+```python
+class Embedder:
+    def __init__(self, model: str = "BAAI/bge-m3"): ...  # lazy import here
+    @property
+    def dim(self) -> int: ...
+    def embed_texts(self, texts) -> np.ndarray: ...  # (n, d) float32, L2-normalized
+    def embed_query(self, text: str) -> np.ndarray: ...  # (d,)
+```
+- Wraps `mlx_embedding_models.embedding.EmbeddingModel.from_pretrained(...)` / `.encode(...)`. ImportError names the pip package. bge-m3 is symmetric (no query/passage prefixes). Outputs L2-normalized float32 to match `VectorIndex`.
+
+### `summary_parse.py` (pure stdlib — the reliability mitigation)```python
 @dataclass
 class TopicItem:
     title: str
@@ -255,20 +307,28 @@ class Poster:
 
 ### `bot.py`
 ```python
-class MeetingBot(discord.Client):
+def rejoin_allowed(manual_leave: bool, human_count: int) -> bool: ...
+
+class MeetingBot(discord.Bot):   # py-cord Bot subclasses Client — run/intents/events unchanged
     def __init__(self, cfg: Config, *, intents=...): ...
     async def on_ready(self): ...
     async def on_voice_state_update(self, member, before, after): ...
     async def _start_meeting(self, channel): ...
-    async def _finalize(self, channel): ...
+    async def _finalize(self, channel, *, force_disconnect: bool = False): ...
 ```
-- Intents: `guilds`, `voice_states`, and `members` (members is a **privileged** intent — note in `.env.example`/README that it must be enabled in the Developer Portal).
+- **Base class is py-cord's `discord.Bot`** (verified against the pinned DAVE commit: `Bot.__init__(description=None, *args, **options)` forwards to `Client`, so `intents=` and `run(token)` behave identically). Two guild-scoped slash commands are registered idempotently in `__init__` (guard flag) via the instance decorator with `guild_ids=[cfg.guild_id]` (instant sync; no ~1 hr global propagation); anyone in the guild may invoke them:
+  - `/leave` — if no meeting active: disconnect any lingering voice client + ephemeral "ไม่มีการประชุมอยู่ตอนนี้". Otherwise `ctx.respond("⏳ กำลังสรุปการประชุม…")` **immediately** (interaction tokens expire in 15 min; finalize takes minutes) and spawn `_finalize(channel, force_disconnect=True)` as a background task. Never raises past the handler.
+  - `/join` — clears `_manual_leave`; ephemeral "already connected" note if a meeting/connection exists; ephemeral ack + background `_start_meeting(channel)` when humans are present; polite ephemeral note when the channel is empty.
+- **Force-disconnect finalize:** `force_disconnect=False` keeps every behavior below unchanged. When `True` (`/leave`), set `_manual_leave = True`, skip the humans-present keep-connection race-guard branch entirely (a human joining mid-forced-finalize must not resurrect the meeting), always tear down + disconnect, and still serialize on `_meeting_lock` (a concurrent auto-finalize makes the forced call fall through to the connection-teardown path).
+- **Rejoin suppression:** while `_manual_leave` is set, block `_start_meeting` from the voice-state handler; clear the flag only when the target channel is observed with zero humans, then normal auto-rejoin resumes. The gate decision is the module-level pure function `rejoin_allowed(manual_leave, human_count)`.
+- Intents: `guilds`, `voice_states`, and `members` (members is a **privileged** intent — note in `.env.example`/README that it must be enabled in the Developer Portal). No Message Content intent.
 - Join self-muted/deaf (correct py-cord sequence): `vc = await channel.connect()` (VocalGuildChannel.connect accepts only `timeout`/`reconnect`/`cls`); then `await guild.change_voice_state(channel=channel, self_mute=True, self_deaf=True)` (returns `None` — it does **not** create the VoiceClient); then `vc.start_recording(sink)`.
 - **Trigger:** in `on_voice_state_update`, count **humans** — `[m for m in channel.members if not m.bot]` — never gate on `member == self.user and before.channel.members == 1` (members includes the bot).
   - Humans present in the target voice channel and not connected → `_start_meeting`.
   - Target channel now has no humans and we're connected → `_finalize`.
   - A human left the target channel but humans remain and the meeting is active → `sink.flush_user(member.id)` (flush that speaker's trailing audio into the transcript).
-- **Finalize:** stop recording, then `transcriber.stop(flush=True)` (drains the input queue so the flushed trailing chunk is transcribed) and `drain(timeout)` for pending events, then build the transcript. If `transcript.is_empty()`, post a "no speech detected" note instead of calling the summarizer. Otherwise summarize (via `asyncio.to_thread`), parse, post the embed + file to the target channel, then disconnect. Handle summarizer failures visibly rather than silently: `except EmptySummaryError` posts a Thai "no summary generated" note; `except StalledGenerationError` (a `RuntimeError` subclass, so catch it **before** the generic `except Exception`) posts a ⚠️ note explaining the output was detected as a repetition loop and pointing at `REPETITION_WINDOW_CHARS` / `REPETITION_MIN_REPEATS`. Do **not** rely on `stop_recording`'s `once_done` callback firing (the pinned branch has a known truthiness bug with empty args) — drive finalize from `on_voice_state_update` directly.
+- **Finalize:** stop recording, then `transcriber.stop(flush=True)` (drains the input queue so the flushed trailing chunk is transcribed) and `drain(timeout)` for pending events, then build the transcript. If `transcript.is_empty()`, post a "no speech detected" note instead of calling the summarizer. Otherwise build the prompt via `_build_prompt(transcript, cfg)` (RAG retrieval when `rag_enabled`, legacy truncated render otherwise — see below), summarize via `asyncio.to_thread`, parse, run the optional kien-thai polish pass, post the embed + file to the target channel, then disconnect. Handle summarizer failures visibly rather than silently: `except EmptySummaryError` posts a Thai "no summary generated" note; `except StalledGenerationError` (a `RuntimeError` subclass, so catch it **before** the generic `except Exception`) posts a ⚠️ note explaining the output was detected as a repetition loop and pointing at `REPETITION_WINDOW_CHARS` / `REPETITION_MIN_REPEATS`. Do **not** rely on `stop_recording`'s `once_done` callback firing (the pinned branch has a known truthiness bug with empty args) — drive finalize from `on_voice_state_update` directly.
+- **RAG prompt construction (`_build_prompt`).** Runs inside the same worker thread as the gateway call (the embedder may load a ~2 GB model). When `cfg.rag_enabled`: chunk the transcript (`chunk_chars=cfg.rag_chunk_chars`, `overlap_chars=cfg.rag_overlap_chars`), embed chunks with `Embedder(cfg.embedding_model)`, index them, run one fixed five-query Thai set (overall gist / topics discussed / decisions made / action items & owners / unresolved questions), union top-k per query (`cfg.rag_top_k`), dedupe + chronological order via `query_multi`, join chunk texts, hard-cap at `cfg.max_prompt_chars` with `truncate_block`. Log `rag: chunks=%d retrieved=%d prompt_chars=%d`. Any failure (ImportError, embed error, empty index) logs a warning and falls back to `Transcript.to_prompt_text(max_chars=...)`; posting is never blocked. `RAG_ENABLED=false` ⇒ byte-for-byte legacy prompt.
 - **Race guard:** `_meeting_active` flag + lock; re-check humans before disconnecting; a member joining mid-finalize must not double-post.
 - **Watchdog:** if no PCM frames arrive N seconds (e.g. 10 s) after `start_recording`, log a prominent warning referencing py-cord issue #3139 and the required py-cord pin.
 
@@ -297,6 +357,7 @@ py-cord[voice] @ git+https://github.com/Pycord-Development/pycord.git@326b72acc8
 mlx-whisper>=0.4.3
 mlx>=0.32
 anthropic
+mlx-embedding-models    # local RAG embeddings (BAAI/bge-m3); import name mlx_embedding_models
 python-dotenv
 numpy>=2.3.2          # cp314-wheel floor; numba (via mlx-whisper) caps the top at <2.5
 pytest>=9,<10
@@ -312,27 +373,38 @@ VOICE_CHANNEL_ID=    # voice channel to watch
 TARGET_CHANNEL_ID=   # text channel that receives the summary
 ANTHROPIC_BASE_URL=https://gateway.9arm.co
 ANTHROPIC_AUTH_TOKEN=sk-...   # gateway bearer token
-GATEWAY_MODEL=qwen3.6-35b-a3b
+GATEWAY_MODEL=qwen3.8-27b-fp8
 WHISPER_MODEL=mlx-community/whisper-large-v3-mlx
 WHISPER_LANGUAGE=th
 SILENCE_THRESHOLD=0.01
 SILENCE_SECONDS=0.8
 MIN_CHUNK_SECONDS=1.0
 MAX_CHUNK_SECONDS=30.0
-SUMMARIZE_TIMEOUT_SECONDS=180
-MAX_PROMPT_CHARS=48000
+SUMMARIZE_TIMEOUT_SECONDS=300
+MAX_PROMPT_CHARS=135000
 SUMMARY_MAX_TOKENS=8192
 REPETITION_WINDOW_CHARS=300
 REPETITION_MIN_REPEATS=3
+RAG_ENABLED=true
+EMBEDDING_MODEL=BAAI/bge-m3
+RAG_TOP_K=8
+RAG_CHUNK_CHARS=800
+RAG_OVERLAP_CHARS=150
+POLISH_ENABLED=false
+POLISH_API_KEY=
+POLISH_BASE_URL=https://api.opentyphoon.ai/v1
+POLISH_MODEL=typhoon-v2.5-30b-a3b-instruct
+POLISH_MAX_PASSES=20
+POLISH_TIMEOUT_SECONDS=120
 ```
 
-`.env.example` must contain **exactly** the keys `config.py` reads (`_REQUIRED_ENV` + `_OPTIONAL_FLOAT_ENV` names). Runtime-only toggles (`DUMP_CHUNKS_DIR`, `WHISPER_FP16`, `WHISPER_RETRY_TEMPERATURE`, `WHISPER_INITIAL_PROMPT`) are read via `os.environ` by `transcriber.py`/`wav_dump.py` and deliberately do **not** appear here.
+`.env.example` must contain **exactly** the keys `config.py` reads (`_REQUIRED_ENV` + `_OPTIONAL_FLOAT_ENV` names plus the RAG/polish keys read in `load_config`). Runtime-only toggles (`DUMP_CHUNKS_DIR`, `WHISPER_FP16`, `WHISPER_RETRY_TEMPERATURE`, `WHISPER_INITIAL_PROMPT`, `WHISPER_BEAM_SIZE`) are read via `os.environ` by `transcriber.py`/`wav_dump.py` and deliberately do **not** appear as Config keys (they are documented in `.env.example`'s notes section only).
 
 ## Acceptance criteria
 
 1. `python3 -m compileall -q meeting_bot tests` exits 0.
-2. The pure modules (`config`, `audio`, `chunker`, `transcript`, `summary_parse`, `summarizer`, `wav_dump`) import with only stdlib (+ numpy for `audio`/`chunker`) present — no discord/anthropic/mlx_whisper; `wav_dump` and `summarizer` need nothing beyond stdlib.
-3. Every class/function above exists with the documented signature — including `Summarizer.summarize`, `_summarize_once`, `EmptySummaryError`, `StalledGenerationError(..., *, progressed)`, `render_markdown`, the five new `Config` fields, and `Transcript.to_prompt_text(max_chars=48000)`.
+2. The pure modules (`config`, `audio`, `chunker`, `transcript`, `summary_parse`, `summarizer`, `wav_dump`, `rag_store`) import with only stdlib (+ numpy for `audio`/`chunker`/`rag_store`) present — no discord/anthropic/mlx_whisper/mlx_embedding_models/openai; `wav_dump` and `summarizer` need nothing beyond stdlib; `embedder` imports nothing heavy at module scope.
+3. Every class/function above exists with the documented signature — including `Summarizer.summarize`, `_summarize_once`, `EmptySummaryError`, `StalledGenerationError(..., *, progressed)`, `render_markdown`, the RAG/polish `Config` fields, `Transcript.to_prompt_text(max_chars=48000)`, `chunk_transcript`, `VectorIndex.query_multi`, `Embedder.embed_texts`, `MeetingBot._finalize(channel, *, force_disconnect)`, and `rejoin_allowed`.
 4. `main.py` supports `--doctor` and `--help` without connecting.
 5. No tokens or secrets appear in any file.
-6. `.env.example` contains exactly the keys `config.py` reads (`_REQUIRED_ENV` + `_OPTIONAL_FLOAT_ENV` names), including `REPETITION_WINDOW_CHARS`/`REPETITION_MIN_REPEATS`. Runtime toggles (`DUMP_CHUNKS_DIR`, `WHISPER_FP16`, `WHISPER_RETRY_TEMPERATURE`, `WHISPER_INITIAL_PROMPT`) are not Config keys and must not appear.
+6. `.env.example` contains exactly the keys `config.py` reads (`_REQUIRED_ENV` + `_OPTIONAL_FLOAT_ENV` names + RAG/polish keys), including `REPETITION_WINDOW_CHARS`/`REPETITION_MIN_REPEATS` and the `RAG_*`/`EMBEDDING_MODEL` block. Runtime toggles (`DUMP_CHUNKS_DIR`, `WHISPER_FP16`, `WHISPER_RETRY_TEMPERATURE`, `WHISPER_INITIAL_PROMPT`, `WHISPER_BEAM_SIZE`) are not Config keys and must not appear as keys.

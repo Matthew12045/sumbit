@@ -33,8 +33,8 @@ _OPTIONAL_FLOAT_ENV = (
     ("SILENCE_SECONDS", "silence_seconds", 0.8),
     ("MIN_CHUNK_SECONDS", "min_chunk_seconds", 1.0),
     ("MAX_CHUNK_SECONDS", "max_chunk_seconds", 30.0),
-    ("SUMMARIZE_TIMEOUT_SECONDS", "summarize_timeout_seconds", 180.0),
-    ("MAX_PROMPT_CHARS", "max_prompt_chars", 48000.0),
+    ("SUMMARIZE_TIMEOUT_SECONDS", "summarize_timeout_seconds", 300.0),
+    ("MAX_PROMPT_CHARS", "max_prompt_chars", 135000.0),
     ("SUMMARY_MAX_TOKENS", "summary_max_tokens", 8192.0),
     ("REPETITION_WINDOW_CHARS", "repetition_window_chars", 300.0),
     ("REPETITION_MIN_REPEATS", "repetition_min_repeats", 3.0),
@@ -49,18 +49,33 @@ class Config:
     target_channel_id: int
     anthropic_base_url: str      # no trailing /v1 (the SDK appends /v1/messages)
     anthropic_auth_token: str
-    gateway_model: str           # qwen3.6-35b-a3b
+    gateway_model: str           # qwen3.8-27b-fp8
     whisper_model: str           # mlx-community/whisper-large-v3-mlx
     whisper_language: str        # "th"
     silence_threshold: float = 0.01     # RMS speech threshold (~ -40 dBFS)
     silence_seconds: float = 0.8        # trailing silence to close a chunk
     min_chunk_seconds: float = 1.0      # shorter closed chunks are dropped
     max_chunk_seconds: float = 30.0     # force-close cap
-    summarize_timeout_seconds: float = 180.0  # SDK client timeout for gateway
-    max_prompt_chars: int = 48000      # transcript truncation limit (128k-context gateway)
+    summarize_timeout_seconds: float = 300.0  # SDK client timeout for gateway
+    max_prompt_chars: int = 135000      # transcript truncation limit (128k-context fp8 gateway)
     summary_max_tokens: int = 8192     # gateway output-token budget (qwen thinking + richer schema)
     repetition_window_chars: int = 300   # exact-repeat loop detection window
     repetition_min_repeats: int = 3      # identical consecutive windows before declaring a loop
+
+    # -- RAG (per-meeting retrieval over the transcript) -------------------
+    rag_enabled: bool = True
+    embedding_model: str = "BAAI/bge-m3"  # local MLX embeddings (bge-m3)
+    rag_top_k: int = 8                    # top-k chunks retrieved per query
+    rag_chunk_chars: int = 800            # sliding-window chunk size (chars)
+    rag_overlap_chars: int = 150          # trailing lines repeated per chunk
+
+    # -- Polish (Thai-writing audit+fix loop) ------------------------------
+    polish_enabled: bool = False
+    polish_api_key: str = ""  # OpenAI-compatible key for OpenTyphoon
+    polish_base_url: str = "https://api.opentyphoon.ai/v1"
+    polish_model: str = "typhoon-v2.5-30b-a3b-instruct"
+    polish_max_passes: int = 20
+    polish_timeout_seconds: float = 120.0
 
 
 def load_config(path: str | os.PathLike = ".env") -> Config:
@@ -92,6 +107,12 @@ def load_config(path: str | os.PathLike = ".env") -> Config:
             return default
         return float(raw)
 
+    def _optional_bool(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            return default
+        return raw.strip().lower() in ("true", "1", "yes")
+
     return Config(
         discord_token=_required("DISCORD_TOKEN"),
         guild_id=int(_required("GUILD_ID")),
@@ -106,11 +127,22 @@ def load_config(path: str | os.PathLike = ".env") -> Config:
         silence_seconds=_optional_float("SILENCE_SECONDS", 0.8),
         min_chunk_seconds=_optional_float("MIN_CHUNK_SECONDS", 1.0),
         max_chunk_seconds=_optional_float("MAX_CHUNK_SECONDS", 30.0),
-        summarize_timeout_seconds=_optional_float("SUMMARIZE_TIMEOUT_SECONDS", 180.0),
-        max_prompt_chars=int(_optional_float("MAX_PROMPT_CHARS", 48000.0)),
+        summarize_timeout_seconds=_optional_float("SUMMARIZE_TIMEOUT_SECONDS", 300.0),
+        max_prompt_chars=int(_optional_float("MAX_PROMPT_CHARS", 135000.0)),
         summary_max_tokens=int(_optional_float("SUMMARY_MAX_TOKENS", 8192.0)),
         repetition_window_chars=int(_optional_float("REPETITION_WINDOW_CHARS", 300.0)),
         repetition_min_repeats=int(_optional_float("REPETITION_MIN_REPEATS", 3.0)),
+        rag_enabled=_optional_bool("RAG_ENABLED", True),
+        embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3").strip(),
+        rag_top_k=int(os.getenv("RAG_TOP_K", "8")),
+        rag_chunk_chars=int(os.getenv("RAG_CHUNK_CHARS", "800")),
+        rag_overlap_chars=int(os.getenv("RAG_OVERLAP_CHARS", "150")),
+        polish_enabled=_optional_bool("POLISH_ENABLED", False),
+        polish_api_key=os.getenv("POLISH_API_KEY", "").strip(),
+        polish_base_url=os.getenv("POLISH_BASE_URL", "https://api.opentyphoon.ai/v1").strip(),
+        polish_model=os.getenv("POLISH_MODEL", "typhoon-v2.5-30b-a3b-instruct").strip(),
+        polish_max_passes=int(os.getenv("POLISH_MAX_PASSES", "20")),
+        polish_timeout_seconds=_optional_float("POLISH_TIMEOUT_SECONDS", 120.0),
     )
 
 
@@ -160,7 +192,72 @@ def doctor(cfg: Config) -> list[str]:
     # 5. Gateway probe (Anthropic-compatible API, ~10 s timeout).
     lines.append(_gateway_probe_line(cfg))
 
+    # 6. Polish readiness (if enabled).
+    if cfg.polish_enabled:
+        if not cfg.polish_api_key:
+            lines.append("fail: POLISH_API_KEY not set (POLISH_ENABLED=true)")
+        else:
+            lines.append("ok: polish enabled, API key set")
+            lines.append(_polish_probe_line(cfg))
+        lines.append(
+            f"ok: polish model={cfg.polish_model} "
+            f"max_passes={cfg.polish_max_passes} "
+            f"timeout={cfg.polish_timeout_seconds}s"
+        )
+    else:
+        lines.append("ok: polish disabled")
+
+    # 7. RAG readiness (importability only — never loads a model here).
+    if cfg.rag_enabled:
+        try:
+            importlib.import_module("mlx_embedding_models")
+            lines.append(
+                f"ok: mlx_embedding_models importable "
+                f"(EMBEDDING_MODEL={cfg.embedding_model})"
+            )
+        except Exception as exc:  # noqa: BLE001
+            lines.append(
+                "fail: mlx_embedding_models not importable — RAG summarization "
+                f"will fall back to full-transcript truncation "
+                f"({type(exc).__name__}; pip install mlx-embedding-models)"
+            )
+    else:
+        lines.append("ok: rag disabled")
+
     return lines
+
+
+def _polish_probe_line(cfg: Config) -> str:
+    """Cheap OpenTyphoon reachability probe (max_tokens=1, 15 s timeout).
+
+    Never raises; the key is never logged. A slow-but-up API must not fail
+    ``--doctor``, so only hard errors produce ``fail`` lines.
+    """
+    try:
+        import openai
+    except Exception as exc:  # noqa: BLE001
+        return f"fail: openai not importable for polish probe ({type(exc).__name__})"
+    try:
+        client = openai.OpenAI(
+            base_url=cfg.polish_base_url,
+            api_key=cfg.polish_api_key,
+            timeout=15.0,
+            max_retries=0,
+        )
+        response = client.chat.completions.create(
+            model=cfg.polish_model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
+    except Exception as exc:  # noqa: BLE001
+        status_code = getattr(exc, "status_code", None)
+        if status_code in (401, 403):
+            return "fail: polish API auth rejected (bad POLISH_API_KEY)"
+        return f"fail: polish API probe failed ({type(exc).__name__})"
+    finish_reason = getattr(getattr(response, "choices", [None])[0], "finish_reason", None)
+    if finish_reason == "content_filter":
+        return "fail: polish API probe content-filtered"
+    return "ok: polish API probe succeeded"
 
 
 def _gateway_probe_line(cfg: Config) -> str:

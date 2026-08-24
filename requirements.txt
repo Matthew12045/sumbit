@@ -2,6 +2,7 @@ py-cord[voice] @ git+https://github.com/Pycord-Development/pycord.git@326b72acc8
 mlx-whisper>=0.4.3
 mlx>=0.32
 anthropic
+mlx-embedding-models    # local RAG embeddings (BAAI/bge-m3); import name mlx_embedding_models
 python-dotenv
 numpy>=2.3.2          # cp314-wheel floor; numba (via mlx-whisper) caps the top at <2.5
 pytest>=9,<10

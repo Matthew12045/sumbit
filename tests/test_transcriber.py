@@ -16,6 +16,7 @@ def _clear_env(monkeypatch) -> None:
     monkeypatch.delenv("WHISPER_FP16", raising=False)
     monkeypatch.delenv("WHISPER_RETRY_TEMPERATURE", raising=False)
     monkeypatch.delenv("WHISPER_INITIAL_PROMPT", raising=False)
+    monkeypatch.delenv("WHISPER_BEAM_SIZE", raising=False)
 
 
 class TestIsGarbageTranscription:
@@ -185,3 +186,55 @@ class TestDecodeSettings:
     def test_empty_initial_prompt_env_disables_preamble(self, monkeypatch) -> None:
         monkeypatch.setenv("WHISPER_INITIAL_PROMPT", "")
         assert retry_decode_settings().initial_prompt is None
+
+
+class TestBeamSize:
+    """WHISPER_BEAM_SIZE env knob: >1 passes beam_size, <=1 omits it.
+
+    The default is greedy (kwarg omitted): the installed mlx-whisper raises
+    NotImplementedError for beam_size > 1, so production never sends it
+    until the package implements grouped decoding.
+    """
+
+    def test_default_is_greedy_kwarg_omitted(self, monkeypatch) -> None:
+        _clear_env(monkeypatch)
+        settings = primary_decode_settings()
+        assert settings.beam_size == 0
+        kwargs = build_decode_kwargs(settings, language="th")
+        assert "beam_size" not in kwargs
+
+    def test_beam_kwarg_present_when_above_one(self, monkeypatch) -> None:
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("WHISPER_BEAM_SIZE", "8")
+        kwargs = build_decode_kwargs(primary_decode_settings(), language="th")
+        assert kwargs["beam_size"] == 8
+
+    def test_zero_means_greedy_kwarg_omitted(self, monkeypatch) -> None:
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("WHISPER_BEAM_SIZE", "0")
+        for settings in (primary_decode_settings(), retry_decode_settings()):
+            kwargs = build_decode_kwargs(settings, language="th")
+            assert "beam_size" not in kwargs
+
+    def test_one_also_omits_kwarg(self, monkeypatch) -> None:
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("WHISPER_BEAM_SIZE", "1")
+        kwargs = build_decode_kwargs(primary_decode_settings(), language="th")
+        assert "beam_size" not in kwargs
+
+    def test_retry_inherits_beam_size(self, monkeypatch) -> None:
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("WHISPER_BEAM_SIZE", "4")
+        kwargs = build_decode_kwargs(retry_decode_settings(), language="th")
+        assert kwargs["beam_size"] == 4
+
+    def test_non_integer_falls_back_to_greedy_default(self, monkeypatch) -> None:
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("WHISPER_BEAM_SIZE", "not-a-number")
+        assert primary_decode_settings().beam_size == 0
+
+    def test_negative_treated_as_greedy(self, monkeypatch) -> None:
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("WHISPER_BEAM_SIZE", "-3")
+        kwargs = build_decode_kwargs(primary_decode_settings(), language="th")
+        assert "beam_size" not in kwargs

@@ -15,6 +15,7 @@ from .poster import Poster
 from .sink import MeetingSink
 from .summarizer import EmptySummaryError, StalledGenerationError, Summarizer
 from .summary_parse import parse_summary
+from .thai_polish import ThaiPolisher
 from .transcriber import Transcriber
 from .transcript import Transcript
 from . import _pycord_diag  # noqa: F401  # monkeypatches py-cord for DAVE diagnostics
@@ -33,10 +34,79 @@ _VOICE_MONITOR_MAX_FAILURES = 3
 # NoValidCryptorFound. Small buffer over the observed ~5s.
 _AUDIO_GRACE_SECONDS = 6.5
 
+# Fixed multi-query set for RAG retrieval (one query per summary facet).
+# Union of top-k per query, deduped and re-sorted chronologically, gives
+# broad meeting coverage without needing an LLM to formulate queries.
+_RAG_QUERIES = (
+    "สรุปภาพรวมของการประชุมและบทสนทนาหลัก",
+    "หัวข้อที่ถูกพูดถึงในการประชุม",
+    "การตัดสินใจที่ที่ประชุมตกลงกันและเหตุผล",
+    "สิ่งที่ต้องทำ ผู้รับผิดชอบ และกำหนดเวลา",
+    "คำถามหรือประเด็นที่ยังไม่ได้ข้อสรุป",
+)
 
-class MeetingBot(discord.Client):
+
+def _rag_prompt(transcript: Transcript, cfg: Config) -> str:
+    """Build the summarized-excerpt prompt via per-meeting RAG retrieval.
+
+    Heavy work (loading the embedding model, embedding chunks/queries) —
+    must run off the event loop (inside ``asyncio.to_thread``).
+    """
+    from .embedder import Embedder
+    from .rag_store import VectorIndex, chunk_transcript, truncate_block
+
+    chunks = chunk_transcript(
+        transcript.events(),
+        transcript.started_at,
+        chunk_chars=cfg.rag_chunk_chars,
+        overlap_chars=cfg.rag_overlap_chars,
+    )
+    if not chunks:
+        raise ValueError("no transcript chunks to index")
+
+    embedder = Embedder(cfg.embedding_model)
+    index = VectorIndex()
+    index.add(embedder.embed_texts([c.as_embedding_text() for c in chunks]), chunks)
+    hits = index.query_multi(embedder.embed_texts(list(_RAG_QUERIES)), cfg.rag_top_k)
+    if not hits:
+        raise ValueError("retrieval returned no chunks")
+
+    block = "\n\n".join(f"{chunk.header}\n{chunk.text}" for chunk, _ in hits)
+    prompt = truncate_block(block, cfg.max_prompt_chars)
+    log.info("rag: chunks=%d retrieved=%d prompt_chars=%d", len(chunks), len(hits), len(prompt))
+    return prompt
+
+
+def _build_prompt(transcript: Transcript, cfg: Config) -> str:
+    """Gateway prompt: RAG retrieval when enabled, else the legacy full-
+    transcript truncated render. Never raises — any RAG failure falls back
+    to the legacy path so posting is never blocked."""
+    if cfg.rag_enabled and not transcript.is_empty():
+        try:
+            return _rag_prompt(transcript, cfg)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "rag retrieval failed — falling back to full-transcript truncation",
+                exc_info=True,
+            )
+    return transcript.to_prompt_text(max_chars=cfg.max_prompt_chars)
+
+
+def rejoin_allowed(manual_leave: bool, human_count: int) -> bool:
+    """Auto-rejoin gate after a manual ``/leave``.
+
+    While ``manual_leave`` is set, auto-start stays suppressed until the
+    voice channel has been observed with zero humans (the caller clears the
+    flag on that observation). Pure function so the transition table is
+    unit-testable.
+    """
+    return not manual_leave or human_count == 0
+
+
+class MeetingBot(discord.Bot):
     """Joins the target voice channel, transcribes live, and auto-posts a
-    structured summary when the last human leaves."""
+    structured summary when the last human leaves — or on demand via the
+    ``/leave`` slash command; ``/join`` brings it back manually."""
 
     def __init__(self, cfg: Config, *, intents=None):
         if intents is None:
@@ -44,6 +114,8 @@ class MeetingBot(discord.Client):
             intents.guilds = True
             intents.voice_states = True
             intents.members = True  # privileged — enable in Developer Portal
+        # discord.Bot subclasses Client and forwards kwargs (incl. intents)
+        # to it, so run(token)/event handlers behave identically.
         super().__init__(intents=intents)
         self.cfg = cfg
         self._meeting_active = False
@@ -57,6 +129,107 @@ class MeetingBot(discord.Client):
         self._meeting_started_mono: float | None = None
         self._meeting_started_wall: datetime | None = None
         self._seen_humans: set[int] = set()
+        self._manual_leave = False  # set by /leave; lifted when channel observed empty
+        self._commands_registered = False
+        self._register_slash_commands()
+
+    def _register_slash_commands(self) -> None:
+        """Register guild-scoped /leave and /join exactly once per instance.
+
+        Guild-scoped commands sync instantly (no ~1 hr global propagation).
+        The guard flag keeps gateway reconnects from re-adding duplicates;
+        __init__ runs once anyway, this just makes idempotency explicit.
+        """
+        if self._commands_registered:
+            return
+        self._commands_registered = True
+
+        @self.slash_command(
+            guild_ids=[self.cfg.guild_id],
+            name="leave",
+            description="สรุปการประชุมตอนนี้ โพสต์สรุป แล้วออกจากห้องเสียง",
+        )
+        async def _leave(ctx) -> None:
+            await self._handle_leave(ctx)
+
+        @self.slash_command(
+            guild_ids=[self.cfg.guild_id],
+            name="join",
+            description="ให้บอทเข้าห้องเสียงเพื่อบันทึกการประชุม",
+        )
+        async def _join(ctx) -> None:
+            await self._handle_join(ctx)
+
+    def _target_voice_channel(self):
+        guild = self.get_guild(self.cfg.guild_id)
+        if guild is None:
+            return None
+        return guild.get_channel(self.cfg.voice_channel_id)
+
+    async def _handle_leave(self, ctx) -> None:
+        """/leave: summarize now, post, disconnect — anyone may invoke."""
+        try:
+            if not self._meeting_active:
+                # No meeting running: disconnect if somehow still connected,
+                # then tell the user there is nothing to summarize.
+                vc = self._voice_client
+                if vc is not None and vc.is_connected():
+                    try:
+                        await vc.disconnect()
+                    except Exception:  # noqa: BLE001
+                        log.exception("disconnect failed (non-fatal)")
+                    self._voice_client = None
+                await ctx.respond("ไม่มีการประชุมอยู่ตอนนี้", ephemeral=True)
+                return
+
+            # Interaction tokens expire in 15 min and finalize takes minutes:
+            # ack immediately, then run finalize as a background task.
+            await ctx.respond(
+                "⏳ กำลังสรุปการประชุม… บอทจะออกจากห้องเสียงเมื่อสรุปเสร็จ",
+                ephemeral=True,
+            )
+            channel = self._target_voice_channel()
+            if channel is None:
+                log.error("voice channel %s not found for /leave", self.cfg.voice_channel_id)
+                return
+            asyncio.create_task(self._finalize(channel, force_disconnect=True))
+        except Exception:  # noqa: BLE001 — never raise past the handler
+            log.exception("/leave handler failed")
+            try:
+                await ctx.respond("⚠️ เกิดข้อผิดพลาด ลองใช้คำสั่งอีกครั้งภายหลัง", ephemeral=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _handle_join(self, ctx) -> None:
+        """/join: manual way back in after /leave — anyone may invoke."""
+        try:
+            channel = self._target_voice_channel()
+            if channel is None:
+                await ctx.respond("ไม่พบห้องเสียงที่ตั้งค่าไว้", ephemeral=True)
+                return
+            vc = self._voice_client
+            if self._meeting_active or (vc is not None and vc.is_connected()):
+                await ctx.respond("บอทอยู่ในห้องเสียงอยู่แล้ว", ephemeral=True)
+                return
+            self._manual_leave = False
+            humans = [m for m in channel.members if not m.bot]
+            if humans:
+                await ctx.respond(
+                    f"🔌 กำลังเข้าร่วม {channel.name} เพื่อบันทึกการประชุม",
+                    ephemeral=True,
+                )
+                asyncio.create_task(self._start_meeting(channel))
+            else:
+                await ctx.respond(
+                    "ไม่มีผู้ใช้อยู่ในห้องเสียง — บอทจะเริ่มบันทึกอัตโนมัติเมื่อมีคนเข้าห้อง",
+                    ephemeral=True,
+                )
+        except Exception:  # noqa: BLE001
+            log.exception("/join handler failed")
+            try:
+                await ctx.respond("⚠️ เกิดข้อผิดพลาด ลองใช้คำสั่งอีกครั้งภายหลัง", ephemeral=True)
+            except Exception:  # noqa: BLE001
+                pass
 
     # -- event handlers --------------------------------------------------
 
@@ -95,6 +268,16 @@ class MeetingBot(discord.Client):
             self._seen_humans.add(member.id)
 
         humans = [m for m in channel.members if not m.bot]
+        human_count = len(humans)
+
+        # Rejoin suppression: after a manual /leave, block auto-start until
+        # the voice channel has been observed empty once — then lift the
+        # flag and resume normal auto-rejoin behavior.
+        if not rejoin_allowed(self._manual_leave, human_count):
+            return
+        if self._manual_leave and human_count == 0:
+            self._manual_leave = False
+            log.info("voice channel observed empty — /leave suppression lifted")
 
         if humans and not self._meeting_active:
             await self._start_meeting(channel)
@@ -179,9 +362,26 @@ class MeetingBot(discord.Client):
                 self._voice_monitor(channel)
             )
 
-    async def _finalize(self, channel) -> None:
+    async def _finalize(self, channel, *, force_disconnect: bool = False) -> None:
         async with self._meeting_lock:
-            if not self._meeting_active:
+            if force_disconnect:
+                # Manual /leave: suppress auto-rejoin until the channel is
+                # observed empty once (see rejoin_allowed).
+                self._manual_leave = True
+                if not self._meeting_active:
+                    # A finalize already ran (or never started) — just make
+                    # sure the voice connection is torn down.
+                    vc = self._voice_client
+                    if vc is not None and vc.is_connected():
+                        try:
+                            await vc.disconnect()
+                        except Exception:  # noqa: BLE001
+                            log.exception("disconnect failed (non-fatal)")
+                        self._voice_client = None
+                        self._sink = None
+                        self._transcriber = None
+                    return
+            elif not self._meeting_active:
                 return
             self._meeting_active = False
 
@@ -245,8 +445,6 @@ class MeetingBot(discord.Client):
             log.info("finalize: collected %d transcript events", len(evts))
             for evt in evts:
                 log.info("  event: speaker=%s text=%r", evt.speaker, evt.text)
-            prompt_text = transcript.to_prompt_text(max_chars=self.cfg.max_prompt_chars)
-            log.info("transcript prompt text (first 500 chars): %s", prompt_text[:500] if prompt_text else "(empty)")
 
             if target is None:
                 log.error("target channel %s not found", self.cfg.target_channel_id)
@@ -272,13 +470,16 @@ class MeetingBot(discord.Client):
                 except Exception:  # noqa: BLE001
                     log.exception("failed to post no-speech note")
             else:
+                prompt_chars = {"value": 0}
                 try:
-                    log.info("summarizer prompt length: %d chars", len(prompt_text))
-
                     def _summarize():
-                        # Construct off the loop too: importing anthropic +
-                        # building the httpx client (~0.5-2s first call) must
-                        # never stall the gateway heartbeat.
+                        # Prompt construction (RAG may load a ~2 GB embedding
+                        # model) and the anthropic client bootstrap
+                        # (~0.5-2s first call) both run off the loop so the
+                        # gateway heartbeat never stalls.
+                        prompt_text = _build_prompt(transcript, self.cfg)
+                        prompt_chars["value"] = len(prompt_text)
+                        log.info("summarizer prompt length: %d chars", prompt_chars["value"])
                         summarizer = Summarizer(self.cfg)
                         return summarizer.summarize(prompt_text)
 
@@ -287,6 +488,32 @@ class MeetingBot(discord.Client):
                     summary = parse_summary(summary_text)
                     log.info("parsed summary: topics=%d decisions=%d action_items=%d",
                              len(summary.topics), len(summary.decisions), len(summary.action_items))
+
+                    # Polish Thai prose (kien-thai skill, Register 6)
+                    if self.cfg.polish_enabled:
+                        try:
+                            def _polish():
+                                polisher = ThaiPolisher(
+                                    base_url=self.cfg.polish_base_url,
+                                    auth_token=self.cfg.polish_api_key,
+                                    model=self.cfg.polish_model,
+                                    max_passes=self.cfg.polish_max_passes,
+                                    timeout_seconds=self.cfg.polish_timeout_seconds,
+                                )
+                                result = polisher.polish(summary)
+                                return result, getattr(polisher, "last_stats", None)
+
+                            polished, polish_stats = await asyncio.to_thread(_polish)
+                            summary = polished
+                            log.info(
+                                "thai_polish: %s (passes=%s, overview_len=%d)",
+                                (polish_stats or {}).get("outcome", "done"),
+                                (polish_stats or {}).get("passes", "?"),
+                                len(summary.overview),
+                            )
+                        except Exception:  # noqa: BLE001 — polish failure is non-fatal
+                            log.exception("thai_polish failed — posting unpolished summary")
+
                     poster = Poster(self.cfg)
                     await poster.post(target, summary, meta=meta)
                 except EmptySummaryError:
@@ -324,22 +551,25 @@ class MeetingBot(discord.Client):
                     exc_name = type(exc).__name__
                     if "Timeout" in exc_name or "timeout" in exc_name.lower():
                         log.exception(
-                            "summarizer timed out (prompt was %d chars)", len(prompt_text),
+                            "summarizer timed out (prompt was %d chars)", prompt_chars["value"],
                         )
                     else:
                         log.exception("failed to summarize/post meeting summary")
 
             # Race guard: re-check humans before disconnecting. A member
             # joining mid-finalize must not double-post — keep the connection
-            # so a queued _start_meeting can reuse it.
-            humans_now = [m for m in channel.members if not m.bot]
-            if humans_now:
-                log.info(
-                    "humans present again — keeping voice connection for continued meeting"
-                )
-                self._sink = None
-                self._transcriber = None
-                return
+            # so a queued _start_meeting can reuse it. A forced /leave skips
+            # this branch entirely: the bot always tears down and disconnects,
+            # and /join is the explicit way back in.
+            if not force_disconnect:
+                humans_now = [m for m in channel.members if not m.bot]
+                if humans_now:
+                    log.info(
+                        "humans present again — keeping voice connection for continued meeting"
+                    )
+                    self._sink = None
+                    self._transcriber = None
+                    return
 
             if vc is not None and vc.is_connected():
                 try:

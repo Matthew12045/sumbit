@@ -158,9 +158,10 @@ def main() -> int:
 
     from meeting_bot.summarizer import Summarizer, EmptySummaryError, StalledGenerationError
 
+    summarizer = Summarizer(cfg)
     t0 = time.monotonic()
     try:
-        raw = Summarizer(cfg).summarize(prompt_text)
+        raw = summarizer.summarize(prompt_text)
     except EmptySummaryError as exc:
         print(f"E2E FAIL: EmptySummaryError — {exc}")
         return 1
@@ -171,6 +172,22 @@ def main() -> int:
         print(f"E2E FAIL: summarize() raised {type(exc).__name__}: {exc}")
         return 1
     elapsed = time.monotonic() - t0
+
+    # Token accounting: real chars/token for Thai/qwen on this gateway model.
+    usage = getattr(summarizer, "last_usage", None)
+    if usage is not None:
+        input_tokens = getattr(usage, "input_tokens", None)
+        output_tokens = getattr(usage, "output_tokens", None)
+        print(f"usage: input={input_tokens} output={output_tokens}")
+        if output_tokens and len(raw) > 0:
+            ratio = (len(prompt_text) + len(raw)) / max(1, (input_tokens or 0) + output_tokens)
+            out_ratio = len(raw) / max(1, output_tokens)
+            in_ratio = len(prompt_text) / max(1, input_tokens or 1)
+            print(
+                f"chars/token: overall≈{ratio:.2f}  prompt≈{in_ratio:.2f}  "
+                f"output≈{out_ratio:.2f}  (retune MAX_PROMPT_CHARS if this "
+                f"differs materially from the assumed ~1.5)"
+            )
 
     print(f"summarize() OK in {elapsed:.2f}s — raw response ({len(raw)} chars):")
     print("-" * 78)

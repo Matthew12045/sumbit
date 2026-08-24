@@ -50,7 +50,12 @@ _MAX_REPEAT_PERIOD = 10  # characters; covers single chars up to short syllables
 # dataclass / .env.example key set / spec acceptance criterion 6 stay untouched.
 # WHISPER_FP16 must be constant for the whole process (ModelHolder caches the
 # model by path only, not dtype) — set it before the first decode and restart
-# to change it.
+# to change it. WHISPER_BEAM_SIZE flows through transcribe(**decode_options)
+# into DecodingOptions.beam_size — but the INSTALLED mlx-whisper raises
+# ``NotImplementedError("Beam search decoder is not yet implemented")`` for
+# beam_size > 1 (and best_of is incompatible with T=0 greedy), so the knob
+# defaults to 0 = greedy kwarg omitted. Bump it only after upgrading
+# mlx-whisper to a build that implements grouped decoding.
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,7 @@ class _DecodeSettings:
     initial_prompt: str | None = None
     no_speech_threshold: float = 0.6
     fp16: bool = True
+    beam_size: int = 0  # ≤1 ⇒ omit kwarg (greedy); >1 ⇒ pass beam_size
 
 
 # Retry-only preamble: anchors a deterministic repetition attractor. Never
@@ -99,6 +105,16 @@ def _env_str(name: str, default: str) -> str:
     return raw.strip()
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def primary_decode_settings() -> _DecodeSettings:
     """T=0 greedy, clean, unbiased. Same effective behavior as today except
     ``condition_on_previous_text`` is now explicitly False."""
@@ -108,24 +124,33 @@ def primary_decode_settings() -> _DecodeSettings:
         initial_prompt=None,
         no_speech_threshold=0.6,
         fp16=_env_bool("WHISPER_FP16", True),
+        beam_size=_env_int("WHISPER_BEAM_SIZE", 0),
     )
 
 
 def retry_decode_settings() -> _DecodeSettings:
     """Anti-loop retry: small temperature bump + Thai preamble to push the
     decoder off a deterministic greedy attractor. ``fp16`` must match the
-    primary decode (ModelHolder caches the model by path, not dtype)."""
+    primary decode (ModelHolder caches the model by path, not dtype). The
+    beam size is inherited from the primary decode; mlx-whisper itself
+    ignores it whenever temperature > 0."""
     return _DecodeSettings(
         temperature=_env_float("WHISPER_RETRY_TEMPERATURE", 0.2),
         condition_on_previous_text=False,
         initial_prompt=_env_str("WHISPER_INITIAL_PROMPT", _THAI_PREAMBLE) or None,
         no_speech_threshold=0.6,
         fp16=_env_bool("WHISPER_FP16", True),
+        beam_size=_env_int("WHISPER_BEAM_SIZE", 0),
     )
 
 
 def build_decode_kwargs(settings: _DecodeSettings, *, language: str) -> dict:
-    """Translate :class:`_DecodeSettings` into mlx_whisper ``transcribe`` kwargs."""
+    """Translate :class:`_DecodeSettings` into mlx_whisper ``transcribe`` kwargs.
+
+    ``beam_size`` is passed through only when > 1 — mlx-whisper's DecodingOptions
+    defaults it to None (= greedy), and 0/negative values are treated as "omit"
+    so the kwarg never reaches transcribe with a confusing sentinel.
+    """
     kwargs: dict = {
         "language": language,
         "temperature": settings.temperature,
@@ -133,6 +158,8 @@ def build_decode_kwargs(settings: _DecodeSettings, *, language: str) -> dict:
         "no_speech_threshold": settings.no_speech_threshold,
         "fp16": settings.fp16,
     }
+    if settings.beam_size > 1:
+        kwargs["beam_size"] = settings.beam_size
     if settings.initial_prompt:
         kwargs["initial_prompt"] = settings.initial_prompt
     return kwargs

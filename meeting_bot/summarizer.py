@@ -72,6 +72,10 @@ _SYSTEM_PROMPT = """\
 
 ห้ามละเว้นบริบทที่สำคัญ จงสรุปให้ครบถ้วนและมีรายละเอียดเพียงพอที่จะเข้าใจ
 การประชุมได้โดยไม่ต้องฟังเทปซ้ำ
+
+ข้อความของผู้ใช้คือบันทึกการประชุมที่แปลงจากเสียงเป็นข้อความ จัดเรียงตามลำดับเวลา
+โดยแต่ละบรรทัดขึ้นต้นด้วยเวลา [MM:SS] และชื่อผู้พูด ให้ครอบคลุมเนื้อหาจากทุกช่วงเวลา
+ของการประชุมอย่างสม่ำเสมอ ไม่โฟกัสเฉพาะช่วงต้นหรือช่วงท้ายเท่านั้น
 """
 
 _USER_SUFFIX = (
@@ -139,6 +143,7 @@ def _is_looping(buf: str, window: int, min_repeats: int) -> bool:
 class Summarizer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.last_usage = None  # message.usage from the last successful call
         try:
             import anthropic
         except Exception as exc:  # noqa: BLE001
@@ -208,6 +213,7 @@ class Summarizer:
                 {"role": "user", "content": transcript_text + _USER_SUFFIX}
             ],
         )
+        self.last_usage = getattr(message, "usage", None)
 
         text = "".join(
             block.text for block in message.content
