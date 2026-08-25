@@ -57,6 +57,7 @@ tests/
   test_transcriber.py
   test_wav_dump.py
   test_summarizer.py
+  test_summarizer_prompt.py
   test_poster.py
   test_thai_polish.py
   test_rag_store.py
@@ -276,7 +277,16 @@ class Summarizer:
 
 **Retry policy.** `summarize()` retries **once, and only on `APITimeoutError`** — a gateway hiccup with no response ever starting. `EmptySummaryError` and `StalledGenerationError` are **never** retried (`StalledGenerationError` is always `progressed=True`): `temperature=0` means re-running reproduces the same trace. `max_retries=0` disables the SDK's own retry loop (the manual policy above is authoritative).
 
-**Contract & schema.** `timeout=cfg.summarize_timeout_seconds` on the client; `max_tokens=cfg.summary_max_tokens`, `temperature=0.0`. The Thai system prompt instructs the model to reply only in Thai and output **only** the JSON below (no markdown fence, no other text); the user message appends a suffix demanding empty sections be `[]`/`""`/`null` per type:
+**Contract & schema.** `timeout=cfg.summarize_timeout_seconds` on the client; `max_tokens=cfg.summary_max_tokens`, `temperature=0.0`; the `Summarizer.summarize` / `_summarize_once` signatures, the retry policy, and token handling are unchanged. The system prompt sent to the gateway is **base + tier**: the static Thai base `_SYSTEM_PROMPT` instructs Thai-only replies and JSON-only output with no markdown fence and no prose outside the JSON; carries strict **grounding rules** — summarize only facts present in the transcript, never invent facts, person names, numbers, dates, decisions, or action items (every sentence must trace back to the transcript), unknown `"owner"`/`"due"` → `null`, empty sections → `[]`/`""`/`null` per field type with sending-empty always correct and never padded with filler, and no advice/opinions/recommendations that were not voiced in the meeting; and closes with the input-format paragraph (`[MM:SS] speaker:` chronological lines; a bare `[MM:SS]` or `[MM:SS–MM:SS]` header is an excerpt-range label cut from retrieval, not a speaker, with even coverage across all ranges). On top of the base, `_system_prompt_for(transcript_text)` appends a per-request **length-tier block** chosen from the stripped input char count: `<1200` chars → XS, `<6000` → S, `<30000` → M, `≥30000` → L. Per-tier ceilings (overview sentences / topics / decisions / actions / open questions):
+
+| Tier | overview | topics | decisions | action items | open questions |
+|------|----------|--------|-----------|--------------|----------------|
+| XS   | 1–2 sentences | ≤2 | ≤2 | ≤3 | ≤2 |
+| S    | 2–4 | ≤4 | ≤4 | ≤5 | ≤3 |
+| M    | 3–6 | ≤8 | ≤8 | ≤10 | ≤5 |
+| L    | 4–8 | ≤12 | ≤12 | ≤15 | ≤8 |
+
+M preserves the pre-2026-08-25 fixed numbers verbatim; the tier block tells the model to fill its tier adequately but never stretch or fabricate content to reach a ceiling. The user message appends `_USER_SUFFIX`, which gained a grounding reinforcement sentence (transcript-only facts, no guessing) on top of the JSON-only and empty-section-fallback demands:
 
 ```json
 {
@@ -348,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
 - `test_transcriber.py`: `is_garbage_transcription` heuristics (long char runs, token-ratio, Thai no-whitespace repetition); Thai politeness particles (`ครับ ครับ ครับ`, `ค่ะ ค่ะ`) never flagged; `should_retry` (garbage → retry, high `no_speech_prob` → retry, empty/whitespace → never, threshold is strictly `>`); `build_decode_kwargs` primary (T=0, `condition_on_previous_text=False`, no prompt) vs retry (temperature > 0, Thai preamble); env toggles `WHISPER_FP16`/`WHISPER_RETRY_TEMPERATURE`/`WHISPER_INITIAL_PROMPT`.
 - `test_wav_dump.py`: inert when `DUMP_CHUNKS_DIR` unset; writes well-formed 16 kHz mono 16-bit PCM; float32→int16 clamp; filename sanitization + zero-padded sort.
 - `test_summarizer.py`: `_is_looping` fires at exactly `min_repeats` identical trailing windows and never false-positives on repetitive JSON (`"owner":` keys); guard clauses (`window<=0`, `min_repeats<2`, `len < window*min_repeats`) → False; `StalledGenerationError` stores `.progressed`; retry policy via a fake `_summarize_once` — `APITimeoutError` retries once then raises, `EmptySummaryError` / `StalledGenerationError`(progressed=True) raise without retry; a fake `messages.create` drives the post-hoc loop and empty-summary branches. `summarizer` imports only stdlib + `.config` at module scope, so this test runs with no `anthropic` installed (build the Summarizer via `object.__new__` to bypass `__init__`).
+- `test_summarizer_prompt.py`: grounding-rule sentinels (`ห้ามเดา`, `ห้ามสร้าง`, `ให้ใช้ null`, `ห้ามเพิ่มคำแนะนำ`, `ค่าว่าง`, `markdown fence`) present in the base prompt and in every tier's `_system_prompt_for` render; base prompt contains no digits (all numbers live in the appended tier block); `_size_tier` boundary table (empty/1 char → XS, exactly `_TIER_XS_MAX_CHARS` → S, ±1 around `_TIER_S_MAX_CHARS` → S/M, ±1 around `_TIER_M_MAX_CHARS` → M/L, 200k chars → L); `_TIER_SPECS` values monotonically non-decreasing across `_TIER_ORDER` with `min <= max` pairs per tier; `_system_prompt_for` at each tier midpoint shares the base prefix and yields four distinct renders, with the appended instruction length non-decreasing from S upward (the XS label is deliberately wordier than S's, so XS→S scaling is covered by the ceiling monotonicity instead); the M-tier render pins the legacy wording (`3-6 ประโยค`, `ไม่เกิน 8 หัวข้อ`); a fake-client `Summarizer` built via `object.__new__` captures `messages.create(**kwargs)` and asserts `system == _system_prompt_for(input)` for both an XS-sized and a >30k-char input (two distinct systems), `content == transcript + _USER_SUFFIX`, and `temperature == 0.0`; `_SYSTEM_PROMPT`/`_USER_SUFFIX` remain importable strings containing `JSON`/`null` (the `tools/gateway_test_matrix.py` import contract).
 - `test_poster.py` (guarded by `pytest.importorskip("discord")` — skips in a minimal env; `poster` imports `discord` at module scope): the pure `_fit_to_pool` allocator (unchanged when desired fits, proportional scaling when it overflows, zero pool → all zeros); a **rich-summary regression** that builds a full embed with a 2000-char overview and every field near-maxed and asserts the title + description + field names/values + footer total stays `<= 6000` (Discord's hard limit — the old fixed caps reached 6286 and would 400); a short-summary case asserting nothing is needlessly truncated.
 
 ## `requirements.txt` (pin exactly)

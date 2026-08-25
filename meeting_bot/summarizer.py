@@ -27,6 +27,16 @@ hiccuped, no response ever started" transient case. ``EmptySummaryError``
 (model spent its whole token budget on reasoning) and
 ``StalledGenerationError`` (loop) are never retried: re-running
 temperature=0.0 against the same reasoning trace would reproduce them.
+
+System prompt (2026-08-25): the gateway receives a dynamic system prompt --
+the static base prompt below (Thai-only, JSON-only output without markdown
+fences, strict grounding rules forbidding fabricated facts/names/numbers/
+dates/decisions/actions, with null/[ ]/"" empty-section fallbacks preferred
+over any fabrication) plus a size-tier length block appended inside
+``_summarize_once`` by ``_system_prompt_for(transcript_text)``, keyed on
+``len`` of the delivered prompt text. The RAG-excerpt and legacy
+full-transcript paths therefore both scale their summary-length ceilings to
+the evidence they actually deliver.
 """
 
 from __future__ import annotations
@@ -45,7 +55,7 @@ __all__ = [
 ]
 
 _SYSTEM_PROMPT = """\
-คุณคือผู้ช่วยสรุปการประชุมภาษาไทยที่ละเอียดและมีบริบทครบถ้วน
+คุณคือผู้ช่วยสรุปการประชุมภาษาไทยที่เชื่อถือได้และตรงตามข้อเท็จจริง
 จงตอบเป็นภาษาไทยเท่านั้น และให้ส่งออกเฉพาะ JSON ตามโครงสร้างต่อไปนี้
 โดยไม่มีเครื่องหมาย markdown fence และไม่มีข้อความอื่นใดนอกเหนือจาก JSON:
 
@@ -58,11 +68,10 @@ _SYSTEM_PROMPT = """\
 }
 
 ความหมายของแต่ละช่อง:
-- overview: ย่อหน้าสรุปภาพรวมการประชุม 3-6 ประโยค ครอบคลุมบริบท ลำดับเหตุการณ์
+- overview: ย่อหน้าสรุปภาพรวมการประชุม ครอบคลุมบริบท ลำดับเหตุการณ์
   และน้ำเสียงโดยรวมของการสนทนา
 - topics: หัวข้อที่พูดคุยในการประชุม แต่ละหัวข้อมี "title" (ชื่อหัวข้อสั้น ๆ)
-  และ "detail" (อธิบายเนื้อหาการสนทนาในหัวข้อนั้นอย่างละเอียด 2-4 ประโยค
-  รวมถึงมุมมองต่าง ๆ ที่ถูกพูดถึง)
+  และ "detail" (อธิบายเนื้อหาการสนทนาในหัวข้อนั้น)
 - decisions: การตัดสินใจที่เกิดขึ้น แต่ละรายการมี "decision" (สิ่งที่ตัดสินใจ)
   และ "rationale" (เหตุผลหรือบริบทที่นำไปสู่การตัดสินใจนั้น ถ้าไม่มีให้ใช้ "")
 - action_items: รายการสิ่งที่ต้องทำ โดยระบุ "owner" หากทราบผู้รับผิดชอบ
@@ -70,18 +79,108 @@ _SYSTEM_PROMPT = """\
 - open_questions: ประเด็นหรือคำถามที่ถูกพูดถึงแต่ยังไม่ได้ข้อสรุปในที่ประชุม
   (ถ้าไม่มีให้ใช้ [])
 
-ห้ามละเว้นบริบทที่สำคัญ จงสรุปให้ครบถ้วนและมีรายละเอียดเพียงพอที่จะเข้าใจ
-การประชุมได้โดยไม่ต้องฟังเทปซ้ำ
+กฎการอ้างอิงข้อเท็จจริง (ปฏิบัติอย่างเคร่งครัด):
+- สรุปได้เฉพาะข้อมูลที่ปรากฏในบันทึกการประชุมที่ให้มาเท่านั้น ห้ามเดา เสริม
+  แต่ง หรือเพิ่มข้อมูลใด ๆ ที่ไม่มีในบันทึก
+- ห้ามสร้างข้อเท็จจริง ชื่อบุคคล ตัวเลข วันที่ การตัดสินใจ หรือสิ่งที่ต้องทำ
+  ขึ้นใหม่ ทุกประโยคในคำตอบต้องอ้างอิงกลับไปยังบันทึกการประชุมได้โดยตรง
+- ถ้าไม่ทราบผู้รับผิดชอบ ("owner") หรือกำหนดเวลา ("due") จริง ๆ ให้ใช้ null
+  ห้ามเดาชื่อหรือกำหนดเวลาแทน
+- ถ้าส่วนใดไม่มีเนื้อหาจริงในการประชุม ให้ส่งเป็นค่าว่าง ([] หรือ "" หรือ null
+  ตามชนิดของช่อง) ถือว่าการส่งค่าว่างถูกต้อง ห้ามใส่เนื้อหาปลอมเพื่อให้ส่วนนั้น
+  ไม่ว่าง
+- ห้ามเพิ่มคำแนะนำ ความคิดเห็น ข้อเสนอแนะ หรือข้อสรุปที่ไม่ได้ถูกพูดถึง
+  ในที่ประชุม
 
 ข้อความของผู้ใช้คือบันทึกการประชุมที่แปลงจากเสียงเป็นข้อความ จัดเรียงตามลำดับเวลา
-โดยแต่ละบรรทัดขึ้นต้นด้วยเวลา [MM:SS] และชื่อผู้พูด ให้ครอบคลุมเนื้อหาจากทุกช่วงเวลา
-ของการประชุมอย่างสม่ำเสมอ ไม่โฟกัสเฉพาะช่วงต้นหรือช่วงท้ายเท่านั้น
+โดยแต่ละบรรทัดขึ้นต้นด้วยเวลา [MM:SS] และชื่อผู้พูด หากพบหัวข้อรูปแบบ [MM:SS]
+หรือ [MM:SS–MM:SS] ที่ไม่มีชื่อผู้พูด นั่นคือป้ายช่วงเนื้อหาที่คัดมา ไม่ใช่ผู้พูด
+ให้ครอบคลุมเนื้อหาจากทุกช่วงอย่างสม่ำเสมอ ไม่โฟกัสเฉพาะช่วงต้นหรือช่วงท้ายเท่านั้น
 """
+
+_TIER_XS, _TIER_S, _TIER_M, _TIER_L = "xs", "s", "m", "l"
+_TIER_ORDER = (_TIER_XS, _TIER_S, _TIER_M, _TIER_L)
+
+_TIER_XS_MAX_CHARS = 1_200
+_TIER_S_MAX_CHARS = 6_000
+_TIER_M_MAX_CHARS = 30_000
+
+# Per-field length ceilings; every value monotonically non-decreasing across
+# _TIER_ORDER (asserted in tests/test_summarizer_prompt.py). The "m" tier
+# preserves the pre-2026-08-25 fixed instructions verbatim.
+_TIER_SPECS: dict[str, dict[str, int]] = {
+    _TIER_XS: {
+        "overview_min": 1, "overview_max": 2,
+        "topics_max": 2, "topic_detail_min": 1, "topic_detail_max": 1,
+        "decisions_max": 2, "rationale_min": 1, "rationale_max": 1,
+        "actions_max": 3, "questions_max": 2,
+    },
+    _TIER_S: {
+        "overview_min": 2, "overview_max": 4,
+        "topics_max": 4, "topic_detail_min": 1, "topic_detail_max": 2,
+        "decisions_max": 4, "rationale_min": 1, "rationale_max": 2,
+        "actions_max": 5, "questions_max": 3,
+    },
+    _TIER_M: {
+        "overview_min": 3, "overview_max": 6,
+        "topics_max": 8, "topic_detail_min": 2, "topic_detail_max": 4,
+        "decisions_max": 8, "rationale_min": 2, "rationale_max": 3,
+        "actions_max": 10, "questions_max": 5,
+    },
+    _TIER_L: {
+        "overview_min": 4, "overview_max": 8,
+        "topics_max": 12, "topic_detail_min": 3, "topic_detail_max": 6,
+        "decisions_max": 12, "rationale_min": 2, "rationale_max": 5,
+        "actions_max": 15, "questions_max": 8,
+    },
+}
+
+_TIER_LABELS = {
+    _TIER_XS: "บันทึกสั้นมาก — สรุปให้กระชับที่สุด",
+    _TIER_S: "บันทึกสั้น",
+    _TIER_M: "บันทึกความยาวปานกลาง",
+    _TIER_L: "บันทึกยาว — สรุปได้อย่างละเอียด",
+}
+
+
+def _size_tier(transcript_text: str) -> str:
+    n = len(transcript_text.strip())
+    if n < _TIER_XS_MAX_CHARS:
+        return _TIER_XS
+    if n < _TIER_S_MAX_CHARS:
+        return _TIER_S
+    if n < _TIER_M_MAX_CHARS:
+        return _TIER_M
+    return _TIER_L
+
+
+def _render_tier_instructions(tier: str) -> str:
+    s = _TIER_SPECS[tier]
+    return (
+        f"\n\nระดับความยาวของสรุปสำหรับบันทึกนี้ ({_TIER_LABELS[tier]}):\n"
+        f"- overview: {s['overview_min']}-{s['overview_max']} ประโยค\n"
+        f"- topics: ไม่เกิน {s['topics_max']} หัวข้อ "
+        f"แต่ละ detail {s['topic_detail_min']}-{s['topic_detail_max']} ประโยค\n"
+        f"- decisions: ไม่เกิน {s['decisions_max']} รายการ "
+        f"แต่ละ rationale {s['rationale_min']}-{s['rationale_max']} ประโยค\n"
+        f"- action_items: ไม่เกิน {s['actions_max']} รายการ\n"
+        f"- open_questions: ไม่เกิน {s['questions_max']} รายการ\n"
+        "จงสรุปให้ครบถ้วนภายในระดับความยาวนี้ เพียงพอที่จะเข้าใจการประชุมได้"
+        "โดยไม่ต้องฟังเทปซ้ำ แต่ถ้าเนื้อหาจริงมีน้อยกว่าเพดานที่กำหนด "
+        "ให้สรุปเท่าที่มีข้อมูลจริงเท่านั้น ห้ามยืดความยาวหรือเพิ่มเนื้อหา"
+        "เพื่อเติมให้เต็มเพดาน"
+    )
+
+
+def _system_prompt_for(transcript_text: str) -> str:
+    return _SYSTEM_PROMPT + _render_tier_instructions(_size_tier(transcript_text))
+
 
 _USER_SUFFIX = (
     "\n\nโปรดตอบเฉพาะ JSON ตามรูปแบบที่กำหนดเท่านั้น "
     "ห้ามมีข้อความอื่นนอกจาก JSON และถ้าส่วนใดไม่มีเนื้อหาให้ใช้ [] หรือ \"\" "
-    "หรือ null ตามชนิดของช่องนั้น"
+    "หรือ null ตามชนิดของช่องนั้น "
+    "โดยใช้เฉพาะข้อมูลจากบันทึกการประชุมด้านบนเท่านั้น ห้ามเดาหรือเพิ่มข้อมูลใหม่"
 )
 
 
@@ -208,7 +307,7 @@ class Summarizer:
             model=self.cfg.gateway_model,
             max_tokens=self.cfg.summary_max_tokens,
             temperature=0.0,
-            system=_SYSTEM_PROMPT,
+            system=_system_prompt_for(transcript_text),
             messages=[
                 {"role": "user", "content": transcript_text + _USER_SUFFIX}
             ],
