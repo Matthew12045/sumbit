@@ -58,11 +58,22 @@ def test_stalled_generation_error_tracks_progressed():
 # -- Summarizer retry policy (no anthropic) --------------------------------
 
 
+class _GatewayStatusError(RuntimeError):
+    """Stand-in for anthropic.InternalServerError carrying status_code."""
+
+    def __init__(self, status_code: int = 524):
+        super().__init__(f"error status {status_code}")
+        self.status_code = status_code
+
+
 def _make_summarizer() -> sm.Summarizer:
     """Build a Summarizer without touching anthropic (bypass __init__)."""
     s = object.__new__(sm.Summarizer)
     s.cfg = SimpleNamespace(summarize_timeout_seconds=180.0)
-    s._anthropic = SimpleNamespace(APITimeoutError=RuntimeError)
+    s._anthropic = SimpleNamespace(
+        APITimeoutError=RuntimeError,
+        InternalServerError=_GatewayStatusError,
+    )
     s._client = None
     return s
 
@@ -113,6 +124,55 @@ def test_stalled_generation_loop_never_retries(monkeypatch):
     with pytest.raises(StalledGenerationError):
         s.summarize("t")
     # Post-hoc loop, always progressed=True -> never retried.
+    assert len(calls) == 1
+
+
+def test_gateway_524_retries_once_then_raises(monkeypatch):
+    monkeypatch.setattr(sm.time, "sleep", lambda _seconds: None)
+    s = _make_summarizer()
+    calls: list[str] = []
+
+    def fake_once(text: str) -> str:
+        calls.append(text)
+        raise _GatewayStatusError(524)
+
+    s._summarize_once = fake_once
+    with pytest.raises(_GatewayStatusError):
+        s.summarize("t")
+    # First attempt + one identical retry, then give up.
+    assert len(calls) == 2
+
+
+def test_gateway_524_retry_succeeds(monkeypatch):
+    monkeypatch.setattr(sm.time, "sleep", lambda _seconds: None)
+    s = _make_summarizer()
+    calls: list[str] = []
+
+    def fake_once(text: str) -> str:
+        calls.append(text)
+        if len(calls) == 1:
+            raise _GatewayStatusError(524)
+        return "summary"
+
+    s._summarize_once = fake_once
+    assert s.summarize("t") == "summary"
+    assert len(calls) == 2
+
+
+def test_internal_server_error_non_524_never_retries(monkeypatch):
+    monkeypatch.setattr(sm.time, "sleep", lambda _seconds: None)
+    s = _make_summarizer()
+    calls: list[str] = []
+
+    def fake_once(text: str) -> str:
+        calls.append(text)
+        raise _GatewayStatusError(500)
+
+    s._summarize_once = fake_once
+    with pytest.raises(_GatewayStatusError):
+        s.summarize("t")
+    # Only Cloudflare 524 joins APITimeoutError in the retry-once club;
+    # other 5xx keep the old never-retried behavior.
     assert len(calls) == 1
 
 

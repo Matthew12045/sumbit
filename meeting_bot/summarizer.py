@@ -22,11 +22,14 @@ output is an exact-repeat loop is still worthless and would confuse the JSON
 parser. A detected loop raises ``StalledGenerationError(progressed=True)`` so
 ``bot.py``'s existing ⚠️ handler fires.
 
-Retry policy: retry once on ``APITimeoutError`` only -- the "gateway
-hiccuped, no response ever started" transient case. ``EmptySummaryError``
-(model spent its whole token budget on reasoning) and
-``StalledGenerationError`` (loop) are never retried: re-running
-temperature=0.0 against the same reasoning trace would reproduce them.
+Retry policy: retry once on ``APITimeoutError`` -- the "gateway
+hiccuped, no response ever started" transient case -- and identically on a
+Cloudflare 524 (``InternalServerError`` with status_code 524), the same
+"no response ever completed" case detected server-side past Cloudflare's
+~120s proxy read timeout. Other 5xx, ``EmptySummaryError`` (model spent its
+whole token budget on reasoning) and ``StalledGenerationError`` (loop) are
+never retried: re-running temperature=0.0 against the same reasoning trace
+would reproduce them.
 
 System prompt (2026-08-25): the gateway receives a dynamic system prompt --
 the static base prompt below (Thai-only, JSON-only output without markdown
@@ -96,6 +99,12 @@ _SYSTEM_PROMPT = """\
 โดยแต่ละบรรทัดขึ้นต้นด้วยเวลา [MM:SS] และชื่อผู้พูด หากพบหัวข้อรูปแบบ [MM:SS]
 หรือ [MM:SS–MM:SS] ที่ไม่มีชื่อผู้พูด นั่นคือป้ายช่วงเนื้อหาที่คัดมา ไม่ใช่ผู้พูด
 ให้ครอบคลุมเนื้อหาจากทุกช่วงอย่างสม่ำเสมอ ไม่โฟกัสเฉพาะช่วงต้นหรือช่วงท้ายเท่านั้น
+
+การปรับรูปแบบตามบริบทของการประชุม:
+ก่อนสรุป ให้พิจารณาจากบันทึกว่าการประชุมนี้มีลักษณะใดเป็นหลัก (เช่น อาจารย์หรือผู้ประเมินให้คอมเมนต์กับสไลด์หรืองานของผู้นำเสนอ การตัดสินใจร่วมกัน การรายงานความคืบหน้า หรือการระดมความคิด) แล้วจัดโครงสร้างการสรุปให้เข้ากับลักษณะนั้น เช่น
+- ถ้าส่วนใหญ่เป็นการให้ข้อเสนอแนะหรือคอมเมนต์กับงานของผู้อื่น: ให้ overview ระบุให้ชัดว่าใครให้ข้อเสนอแนะแก่ใคร และรวมแล้วมีกี่จุดที่ต้องแก้ topics ให้แต่ละ title เป็นชื่อจุดที่ต้องแก้เรียงตามลำดับที่พูด โดย detail ขยายเฉพาะคอมเมนต์ของจุดนั้น action_items ให้ตรงกับสิ่งที่ถูกฝากให้ไปแก้
+- ถ้าเป็นการตัดสินใจหรือการระดมความคิด ให้เน้น decisions และ open_questions ตามที่เกิดขึ้นจริงในที่ประชุม
+ทั้งหมดยังคงยึดกฎการอ้างอิงข้อเท็จจริงข้างต้นเป็นหลัก ใช้เฉพาะข้อมูลและคำเรียกบทบาทที่ปรากฏในบันทึก ห้ามเดาชื่อหรือบทบาทที่ไม่ปรากฏ
 """
 
 _TIER_XS, _TIER_S, _TIER_M, _TIER_L = "xs", "s", "m", "l"
@@ -265,11 +274,14 @@ class Summarizer:
         """Blocking call (intended to run via ``asyncio.to_thread``).
 
         Retries once, but ONLY on ``APITimeoutError`` -- the "gateway
-        hiccuped, no response ever started" transient case.
-        ``EmptySummaryError`` (the model spent its whole token budget on
-        reasoning) and ``StalledGenerationError`` (post-hoc repetition-loop
-        detection) are never retried: re-running temperature=0.0 against the
-        same reasoning trace would reproduce them.
+        hiccuped, no response ever started" transient case -- plus a
+        Cloudflare 524 (``InternalServerError`` with status_code 524), which
+        is retried once exactly like ``APITimeoutError``; other 5xx are not
+        retried. ``EmptySummaryError`` (the model spent its whole token
+        budget on reasoning) and ``StalledGenerationError`` (post-hoc
+        repetition-loop detection) are never retried: re-running
+        temperature=0.0 against the same reasoning trace would reproduce
+        them.
         """
         last_exc: Exception | None = None
         for attempt in range(2):  # 0 = first try, 1 = one timeout retry
@@ -279,6 +291,30 @@ class Summarizer:
                 raise  # never retried -- see docstring
             except StalledGenerationError:
                 raise  # post-hoc loop, always progressed=True -- never retried
+            except self._anthropic.InternalServerError as exc:
+                # Must sit BEFORE the APITimeoutError clause below: the test
+                # suite stands in for APITimeoutError with RuntimeError, a
+                # parent of the InternalServerError test double -- specific-
+                # handler-first is the safe convention anyway (same rationale
+                # as bot.py's StalledGenerationError note).
+                #
+                # Cloudflare in front of the gateway kills any completion
+                # whose bytes stall past its ~120s proxy read timeout with
+                # HTTP 524 -- functionally the same "no response ever
+                # completed" transient class as APITimeoutError, just
+                # detected server-side. Retry once, identically. Any other
+                # 5xx keeps the old never-retried behavior.
+                if getattr(exc, "status_code", None) != 524:
+                    raise
+                last_exc = exc
+                if attempt == 1:
+                    raise
+                log.warning(
+                    "gateway returned 524 (Cloudflare origin read timeout "
+                    "after ~120s), retrying once in 2s...",
+                )
+                time.sleep(2.0)
+                continue
             except self._anthropic.APITimeoutError as exc:
                 last_exc = exc
                 if attempt == 1:
