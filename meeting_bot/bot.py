@@ -555,6 +555,15 @@ class MeetingBot(discord.Bot):
                         )
                     else:
                         log.exception("failed to summarize/post meeting summary")
+                    note = (
+                        f"⚠️ การสร้างสรุปการประชุมล้มเหลว ({exc_name}): "
+                        "gateway ไม่ตอบกลับสำเร็จภายในเวลาที่กำหนด "
+                        "(เช่น Cloudflare 524 origin timeout) — ดูรายละเอียดใน log ของ bot"
+                    )
+                    try:
+                        await target.send(note)
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to post summarize-failure note")
 
             # Race guard: re-check humans before disconnecting. A member
             # joining mid-finalize must not double-post — keep the connection
