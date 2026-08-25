@@ -18,6 +18,7 @@ from .summary_parse import parse_summary
 from .thai_polish import ThaiPolisher
 from .transcriber import Transcriber
 from .transcript import Transcript
+from .transcript_dump import dump_transcript
 from . import _pycord_diag  # noqa: F401  # monkeypatches py-cord for DAVE diagnostics
 
 log = logging.getLogger(__name__)
@@ -470,6 +471,35 @@ class MeetingBot(discord.Bot):
                 except Exception:  # noqa: BLE001
                     log.exception("failed to post no-speech note")
             else:
+                # Persist the raw transcript BEFORE summarizing so every
+                # downstream failure mode (524, timeout, loop, parse,
+                # poster) leaves a recoverable file behind (KB-sized
+                # write — synchronous is fine, no extra thread hop).
+                dump_path = dump_transcript(
+                    transcript,
+                    meeting_title=meeting_title,
+                    started_wall=started_wall,
+                    duration_seconds=int(duration.total_seconds()),
+                    member_count=len(self._seen_humans),
+                )
+                if dump_path:
+                    log.info("transcript saved to %s", dump_path)
+
+                def _recovery_hint(path: str | None) -> str:
+                    """Thai one-liner appended to failure notes when the
+                    raw transcript was saved, quoting a ready-made
+                    manual_summary.py command with exact recovery flags."""
+                    if not path:
+                        return ""
+                    return (
+                        f"\n💾 บันทึกถอดความดิบไว้ที่ {path} — เรียกคืนสรุปด้วย "
+                        f"`python3 tools/manual_summary.py \"{path}\" "
+                        f'--title "{meeting_title}" '
+                        f'--started-at "{started_wall:%Y-%m-%d %H:%M:%S}" '
+                        f"--duration-seconds {int(duration.total_seconds())} "
+                        f"--members {len(self._seen_humans)}`"
+                    )
+
                 prompt_chars = {"value": 0}
                 try:
                     def _summarize():
@@ -526,6 +556,7 @@ class MeetingBot(discord.Bot):
                         "(ใช้โทเค็นทั้งหมดไปกับการคิดคำนวณ) "
                         "ลองเพิ่ม SUMMARY_MAX_TOKENS ในไฟล์ .env"
                     )
+                    note += _recovery_hint(dump_path)
                     try:
                         await target.send(note)
                     except Exception:  # noqa: BLE001
@@ -543,6 +574,7 @@ class MeetingBot(discord.Bot):
                         "(ตรวจพบ repetition loop) ลองเพิ่มค่า REPETITION_WINDOW_CHARS / "
                         "REPETITION_MIN_REPEATS ในไฟล์ .env หรือตรวจสอบ Gateway"
                     )
+                    note += _recovery_hint(dump_path)
                     try:
                         await target.send(note)
                     except Exception:  # noqa: BLE001
@@ -560,6 +592,7 @@ class MeetingBot(discord.Bot):
                         "gateway ไม่ตอบกลับสำเร็จภายในเวลาที่กำหนด "
                         "(เช่น Cloudflare 524 origin timeout) — ดูรายละเอียดใน log ของ bot"
                     )
+                    note += _recovery_hint(dump_path)
                     try:
                         await target.send(note)
                     except Exception:  # noqa: BLE001
